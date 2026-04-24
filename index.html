@@ -55,10 +55,21 @@ button svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8
 .sec-label{font-size:11px;font-weight:500;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
 
 .camera-wrap{position:relative;border-radius:var(--radius);overflow:hidden;border:1px solid var(--border);background:#000}
-video{width:100%;display:block;max-height:220px;object-fit:cover}
+video{width:100%;display:block;max-height:260px;object-fit:cover}
 canvas{display:none}
 .cam-guide{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
-.cam-frame{width:88%;aspect-ratio:1.75;border:2px solid rgba(255,255,255,.7);border-radius:6px;box-shadow:0 0 0 9999px rgba(0,0,0,.4)}
+/* cam-frame サイズは JS で直接設定 */
+.cam-frame{border:2px solid rgba(255,255,255,.85);border-radius:6px;box-shadow:0 0 0 9999px rgba(0,0,0,.45);transition:width .25s,height .25s}
+
+/* 向き選択トグル */
+.orient-toggle{display:flex;gap:6px;margin-bottom:10px}
+.orient-btn{flex:1;display:flex;flex-direction:column;align-items:center;gap:5px;padding:10px 8px;border-radius:var(--radius-sm);border:1.5px solid var(--border2);background:var(--surface2);cursor:pointer;transition:border-color .15s,background .15s;font-size:12px;color:var(--text2)}
+.orient-btn.active{border-color:var(--accent);background:var(--accent-bg);color:var(--accent-text);font-weight:500}
+.orient-btn svg{width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:1.5}
+.orient-btn span{font-size:11px}
+
+/* カメラ解像度バッジ */
+.res-badge{font-size:10px;font-family:'DM Mono',monospace;background:rgba(0,0,0,.55);color:#fff;padding:3px 8px;border-radius:99px;position:absolute;bottom:8px;right:8px;pointer-events:none;z-index:2}
 
 .cropper-section{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:12px}
 .crop-img-wrap{max-height:280px;overflow:hidden;border-radius:var(--radius-sm);background:#111}
@@ -156,9 +167,21 @@ canvas{display:none}
       <input type="file" id="file-input" accept="image/*" style="display:none">
     </div>
     <div id="cam-wrap" style="display:none">
+      <!-- 向き選択 -->
+      <div class="orient-toggle" id="cam-orient-toggle">
+        <div class="orient-btn active" id="ob-land" onclick="setOrientation('landscape')">
+          <svg viewBox="0 0 36 24"><rect x="1" y="1" width="34" height="22" rx="2"/><line x1="6" y1="7" x2="20" y2="7"/><line x1="6" y1="12" x2="26" y2="12"/><line x1="6" y1="17" x2="16" y2="17"/></svg>
+          <span>横向き</span>
+        </div>
+        <div class="orient-btn" id="ob-port" onclick="setOrientation('portrait')">
+          <svg viewBox="0 0 24 36"><rect x="1" y="1" width="22" height="34" rx="2"/><line x1="5" y1="8" x2="15" y2="8"/><line x1="5" y1="13" x2="19" y2="13"/><line x1="5" y1="18" x2="12" y2="18"/></svg>
+          <span>縦向き</span>
+        </div>
+      </div>
       <div class="camera-wrap">
         <video id="video" autoplay playsinline muted></video>
-        <div class="cam-guide"><div class="cam-frame"></div></div>
+        <div class="cam-guide"><div class="cam-frame" id="cam-frame"></div></div>
+        <div class="res-badge" id="res-badge">— × —</div>
         <canvas id="canvas"></canvas>
       </div>
       <div class="btn-group" style="margin-top:8px">
@@ -171,12 +194,24 @@ canvas{display:none}
   <!-- STEP 2: トリミング -->
   <div id="step-crop" style="display:none">
     <div class="sec-label">② トリミング（範囲を選択）</div>
+    <!-- 向き切り替え（トリミング画面でも変更可） -->
+    <div class="orient-toggle" style="margin-bottom:10px">
+      <div class="orient-btn active" id="cb-land" onclick="setCropOrientation('landscape')">
+        <svg viewBox="0 0 36 24"><rect x="1" y="1" width="34" height="22" rx="2"/><line x1="6" y1="7" x2="20" y2="7"/><line x1="6" y1="12" x2="26" y2="12"/><line x1="6" y1="17" x2="16" y2="17"/></svg>
+        <span>横向き</span>
+      </div>
+      <div class="orient-btn" id="cb-port" onclick="setCropOrientation('portrait')">
+        <svg viewBox="0 0 24 36"><rect x="1" y="1" width="22" height="34" rx="2"/><line x1="5" y1="8" x2="15" y2="8"/><line x1="5" y1="13" x2="19" y2="13"/><line x1="5" y1="18" x2="12" y2="18"/></svg>
+        <span>縦向き</span>
+      </div>
+    </div>
     <div class="cropper-section">
       <div class="crop-img-wrap"><img id="crop-img" alt="crop"></div>
       <div class="crop-toolbar">
         <button class="btn-sm" onclick="cropper.rotate(-90)"><svg viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.52"/></svg>左回転</button>
         <button class="btn-sm" onclick="cropper.rotate(90)"><svg viewBox="0 0 24 24" style="transform:scaleX(-1)"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.52"/></svg>右回転</button>
         <button class="btn-sm" onclick="cropper.reset()">リセット</button>
+        <button class="btn-sm" onclick="cropper.setAspectRatio(NaN)">フリー</button>
       </div>
     </div>
     <div class="btn-group">
@@ -251,10 +286,59 @@ let cards = JSON.parse(localStorage.getItem('meishi_v2') || '[]');
 let currentImageData = null;
 let stream = null;
 let cropper = null;
+let cardOrientation = 'landscape'; // 'landscape' | 'portrait'
+
+// 名刺の標準アスペクト比 (ISO 7810 ID-1: 85.6mm × 54mm)
+const ASPECT_LAND = 85.6 / 54;   // ≈ 1.585  横向き
+const ASPECT_PORT = 54 / 85.6;   // ≈ 0.631  縦向き
+
+// カメラ内ガイド枠の幅：ビュー幅に対する比率
+const GUIDE_RATIO = 0.86;
 
 const $ = id => document.getElementById(id);
 const show = id => $(id).style.display = 'block';
 const hide = id => $(id).style.display = 'none';
+
+// ══════════════════════════════════════════════════
+// ORIENTATION
+// ══════════════════════════════════════════════════
+function setOrientation(orient) {
+  cardOrientation = orient;
+  // カメラ画面のトグルボタン
+  $('ob-land').classList.toggle('active', orient === 'landscape');
+  $('ob-port').classList.toggle('active', orient === 'portrait');
+  // トリミング画面のトグルボタンも同期
+  if ($('cb-land')) {
+    $('cb-land').classList.toggle('active', orient === 'landscape');
+    $('cb-port').classList.toggle('active', orient === 'portrait');
+  }
+  updateGuideFrame();
+}
+
+function setCropOrientation(orient) {
+  setOrientation(orient);
+  // トリマーのアスペクト比を即時変更
+  if (cropper) {
+    cropper.setAspectRatio(orient === 'landscape' ? ASPECT_LAND : ASPECT_PORT);
+  }
+}
+
+function updateGuideFrame() {
+  const frame = $('cam-frame');
+  if (!frame) return;
+  const vw = $('video').clientWidth || 340;
+  const guideW = vw * GUIDE_RATIO;
+  const guideH = cardOrientation === 'landscape'
+    ? guideW / ASPECT_LAND
+    : guideW * ASPECT_PORT / ASPECT_PORT * (1 / ASPECT_PORT) * ASPECT_PORT; // = guideW / ASPECT_PORT... simplify:
+
+  // 縦向きはガイド幅を小さく調整して縦長に
+  const fw = cardOrientation === 'landscape' ? guideW : guideW * 0.55;
+  const fh = cardOrientation === 'landscape' ? fw / ASPECT_LAND : fw / ASPECT_PORT;
+
+  frame.style.width  = Math.round(fw) + 'px';
+  frame.style.height = Math.round(fh) + 'px';
+}
 
 // ══════════════════════════════════════════════════
 // FILE / DROP
@@ -277,51 +361,141 @@ function loadFile(file) {
 }
 
 // ══════════════════════════════════════════════════
-// CAMERA
+// CAMERA  — 高精細モード
 // ══════════════════════════════════════════════════
 async function startCamera() {
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } }
-    });
-    $('video').srcObject = stream;
+    // できる限り高解像度を要求（デバイスの最大に近い値を指定）
+    const constraints = {
+      video: {
+        facingMode: { ideal: 'environment' },
+        width:  { ideal: 4096, min: 1280 },
+        height: { ideal: 2160, min: 720 },
+        // 手ブレ防止・高品質
+        advanced: [{ zoom: 1 }]
+      }
+    };
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const v = $('video');
+    v.srcObject = stream;
+
+    // 解像度バッジ更新
+    v.onloadedmetadata = () => {
+      const track = stream.getVideoTracks()[0];
+      const settings = track.getSettings();
+      const w = settings.width  || v.videoWidth;
+      const h = settings.height || v.videoHeight;
+      $('res-badge').textContent = `${w} × ${h}`;
+      updateGuideFrame();
+    };
+
+    // ビデオサイズ変化時にもガイド更新
+    const ro = new ResizeObserver(() => updateGuideFrame());
+    ro.observe(v);
+
     hide('drop-zone'); show('cam-wrap');
-  } catch(e) { showError('カメラへのアクセスが許可されていません。ファイル選択をご利用ください。'); }
+    updateGuideFrame();
+  } catch(e) {
+    showError('カメラへのアクセスが許可されていません。ファイル選択をご利用ください。');
+  }
 }
+
 function stopCamera() {
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   hide('cam-wrap'); show('drop-zone');
 }
+
 function capturePhoto() {
-  const v = $('video'), c = $('canvas');
-  c.width = v.videoWidth; c.height = v.videoHeight;
-  c.getContext('2d').drawImage(v, 0, 0);
+  const v = $('video');
+
+  // ── 実際の映像解像度でキャプチャ ──
+  const vw = v.videoWidth;
+  const vh = v.videoHeight;
+  const c = $('canvas');
+  c.width  = vw;
+  c.height = vh;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(v, 0, 0, vw, vh);
+
+  // ── ガイド枠に対応する映像座標を計算してプリクロップ ──
+  // ガイド枠はビデオ表示領域に対して GUIDE_RATIO の幅
+  const displayW = v.clientWidth;
+  const displayH = v.clientHeight;
+  const scaleX = vw / displayW;
+  const scaleY = vh / displayH;
+
+  const aspect = cardOrientation === 'landscape' ? ASPECT_LAND : ASPECT_PORT;
+  const frameDisplayW = cardOrientation === 'landscape'
+    ? displayW * GUIDE_RATIO
+    : displayW * GUIDE_RATIO * 0.55;
+  const frameDisplayH = frameDisplayW / aspect;
+
+  // ガイド枠の中心は画面中央
+  const fx = (displayW - frameDisplayW) / 2;
+  const fy = (displayH - frameDisplayH) / 2;
+
+  // 映像ピクセル座標に変換（object-fit:cover のオフセットも考慮）
+  // video がカバーモードの場合、実際の映像表示は aspect fit でなく cover
+  const videoAspect = vw / vh;
+  const displayAspect = displayW / displayH;
+  let offsetX = 0, offsetY = 0, renderW = vw, renderH = vh;
+  if (videoAspect > displayAspect) {
+    // 映像が横に広い → 左右がはみ出す
+    renderH = vh;
+    renderW = vh * displayAspect;
+    offsetX = (vw - renderW) / 2;
+  } else {
+    // 映像が縦に高い → 上下がはみ出す
+    renderW = vw;
+    renderH = vw / displayAspect;
+    offsetY = (vh - renderH) / 2;
+  }
+
+  const cropX = Math.round(offsetX + fx * (renderW / displayW));
+  const cropY = Math.round(offsetY + fy * (renderH / displayH));
+  const cropW = Math.round(frameDisplayW * (renderW / displayW));
+  const cropH = Math.round(frameDisplayH * (renderH / displayH));
+
+  // プリクロップキャンバス（ガイド枠内だけ切り出し）
+  const preCrop = document.createElement('canvas');
+  preCrop.width  = cropW;
+  preCrop.height = cropH;
+  preCrop.getContext('2d').drawImage(c, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
   stopCamera();
-  initCropper(c.toDataURL('image/jpeg', 0.95));
+  initCropper(preCrop.toDataURL('image/jpeg', 1.0));
 }
 
 // ══════════════════════════════════════════════════
-// CROPPER
+// CROPPER — ガイド枠と同じアスペクト比で初期化
 // ══════════════════════════════════════════════════
 function initCropper(dataUrl) {
   hide('step-input');
   show('step-crop');
+
+  // トリミング画面のトグルを現在の向きに同期
+  if ($('cb-land')) {
+    $('cb-land').classList.toggle('active', cardOrientation === 'landscape');
+    $('cb-port').classList.toggle('active', cardOrientation === 'portrait');
+  }
+
   const img = $('crop-img');
-  // Reset src to force onload
   img.src = '';
   img.onload = () => {
     if (cropper) { cropper.destroy(); cropper = null; }
+    const aspect = cardOrientation === 'landscape' ? ASPECT_LAND : ASPECT_PORT;
     cropper = new Cropper(img, {
       viewMode: 1,
       dragMode: 'move',
-      aspectRatio: NaN,
-      autoCropArea: 0.88,
+      aspectRatio: aspect,          // カメラガイド枠と同じ比率
+      autoCropArea: 0.98,           // プリクロップ済みなので広めに
       movable: true,
       zoomable: true,
       rotatable: true,
       scalable: false,
-      background: false,
+      background: true,
       guides: true,
+      center: true,
     });
   };
   img.src = dataUrl;
@@ -329,8 +503,15 @@ function initCropper(dataUrl) {
 
 function applyCrop() {
   if (!cropper) return;
-  const canvas = cropper.getCroppedCanvas({ maxWidth: 2000, maxHeight: 2000, imageSmoothingQuality: 'high' });
-  currentImageData = canvas.toDataURL('image/jpeg', 0.95);
+  // 最大 3000px 幅でトリミング（OCR精度のため高解像度維持）
+  const canvas = cropper.getCroppedCanvas({
+    maxWidth: 3000,
+    maxHeight: 3000,
+    imageSmoothingEnabled: true,
+    imageSmoothingQuality: 'high',
+    fillColor: '#fff',
+  });
+  currentImageData = canvas.toDataURL('image/jpeg', 0.98);
   cropper.destroy(); cropper = null;
   hide('step-crop');
   startOCR();
@@ -343,6 +524,9 @@ async function startOCR() {
   show('step-progress');
   hide('step-error');
   try {
+    // 縦書き名刺は PSM 5（縦書き均一ブロック）、横書きは PSM 3（全自動）
+    const psm = cardOrientation === 'portrait' ? '5' : '3';
+
     const worker = await Tesseract.createWorker(['jpn', 'eng'], 1, {
       logger: m => {
         if (m.status === 'recognizing text') {
@@ -355,6 +539,7 @@ async function startOCR() {
         }
       }
     });
+    await worker.setParameters({ tessedit_pageseg_mode: psm });
     const { data: { text } } = await worker.recognize(currentImageData);
     await worker.terminate();
     hide('step-progress');
@@ -615,6 +800,7 @@ function clearAll() {
   ['step-crop','step-progress','step-classify','step-error','cam-wrap'].forEach(hide);
   show('step-input'); show('drop-zone');
   $('prog-fill').style.width='0%'; $('prog-pct').textContent='0%'; $('prog-status').textContent='初期化中...';
+  // 向きはリセットせず保持（次の名刺も同じ向きが多いため）
 }
 function showError(msg) { const e=$('step-error'); e.style.display='block'; e.innerHTML=`<div class="error-msg">⚠️ ${msg}</div>`; }
 
