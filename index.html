@@ -503,45 +503,249 @@ function initCropper(dataUrl) {
 
 function applyCrop() {
   if (!cropper) return;
-  // 最大 3000px 幅でトリミング（OCR精度のため高解像度維持）
   const canvas = cropper.getCroppedCanvas({
-    maxWidth: 3000,
-    maxHeight: 3000,
-    imageSmoothingEnabled: true,
-    imageSmoothingQuality: 'high',
+    maxWidth: 3000, maxHeight: 3000,
+    imageSmoothingEnabled: true, imageSmoothingQuality: 'high',
     fillColor: '#fff',
   });
-  currentImageData = canvas.toDataURL('image/jpeg', 0.98);
+  currentImageData = canvas.toDataURL('image/png'); // PNG の方が前処理に適している
   cropper.destroy(); cropper = null;
   hide('step-crop');
   startOCR();
 }
 
 // ══════════════════════════════════════════════════
-// OCR
+// 画像前処理エンジン（③ OCR精度向上）
+// ══════════════════════════════════════════════════
+
+/**
+ * OCR前処理パイプライン
+ * 1. アップスケール（短辺 2400px 未満なら 2x）
+ * 2. グレースケール変換
+ * 3. コントラスト正規化（ヒストグラム伸長）
+ * 4. アンシャープマスク（エッジ強調）
+ * 5. 適応的閾値処理（Sauvola近似）→ 背景色・照明ムラに強い二値化
+ * 6. 縦書き時：画像を90°回転して横書きOCRで読む
+ */
+async function preprocessImage(dataUrl, isPortrait) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      let sw = img.width, sh = img.height;
+
+      // Step 1: アップスケール（OCR推奨 300dpi 相当を確保）
+      const minSide = Math.min(sw, sh);
+      const scale = minSide < 2400 ? Math.min(2400 / minSide, 2.5) : 1.0;
+      const w = Math.round(sw * scale);
+      const h = Math.round(sh * scale);
+
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+
+      // Step 2 & 3: グレースケール + ヒストグラム伸長（コントラスト正規化）
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const d = imgData.data;
+      const gray = new Uint8Array(w * h);
+
+      // グレースケール化（輝度ベース）
+      for (let i = 0; i < w * h; i++) {
+        gray[i] = Math.round(
+          0.2126 * d[i*4] + 0.7152 * d[i*4+1] + 0.0722 * d[i*4+2]
+        );
+      }
+
+      // ヒストグラム伸長：1%〜99% パーセンタイルを 0〜255 にマッピング
+      const hist = new Int32Array(256);
+      for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+      const total = gray.length;
+      let lo = 0, hi = 255, cumLo = 0, cumHi = 0;
+      for (let v = 0; v < 256; v++) {
+        cumLo += hist[v];
+        if (cumLo / total < 0.01) lo = v;
+      }
+      for (let v = 255; v >= 0; v--) {
+        cumHi += hist[v];
+        if (cumHi / total < 0.01) hi = v;
+      }
+      const range = hi - lo || 1;
+      for (let i = 0; i < gray.length; i++) {
+        gray[i] = Math.min(255, Math.max(0, Math.round((gray[i] - lo) / range * 255)));
+      }
+
+      // Step 4: アンシャープマスク（ガウスぼかし差分でエッジ強調）
+      const blurred = gaussianBlur(gray, w, h, 1.2);
+      const strength = 1.4; // 強調係数
+      for (let i = 0; i < gray.length; i++) {
+        gray[i] = clamp(Math.round(gray[i] + strength * (gray[i] - blurred[i])));
+      }
+
+      // Step 5: Sauvola 近似による適応的二値化
+      //   各ピクセルを周辺ウィンドウ（radius=16px）の統計で閾値化
+      //   → 照明ムラ・グラデーション背景名刺に強い
+      const R = 16;      // ウィンドウ半径
+      const k = 0.18;    // Sauvola パラメータ
+      const binarized = sauvolaBinarize(gray, w, h, R, k);
+
+      // 結果をRGBAに書き戻す
+      for (let i = 0; i < w * h; i++) {
+        const v = binarized[i];
+        d[i*4] = d[i*4+1] = d[i*4+2] = v;
+        d[i*4+3] = 255;
+      }
+      ctx.putImageData(imgData, 0, 0);
+
+      // Step 6: 縦書き時は90°回転して横書きOCRで読む
+      if (isPortrait) {
+        const rc = document.createElement('canvas');
+        rc.width = h; rc.height = w; // 幅と高さを入れ替え
+        const rctx = rc.getContext('2d');
+        rctx.translate(h / 2, w / 2);
+        rctx.rotate(Math.PI / 2); // 反時計回り90° → 縦書きを横書きへ
+        rctx.drawImage(c, -w / 2, -h / 2);
+        resolve(rc.toDataURL('image/png'));
+      } else {
+        resolve(c.toDataURL('image/png'));
+      }
+    };
+    img.src = dataUrl;
+  });
+}
+
+/** ガウスぼかし（1次元カーネル分離） */
+function gaussianBlur(src, w, h, sigma) {
+  const kernel = buildGaussKernel(sigma);
+  const tmp = new Float32Array(w * h);
+  const out = new Uint8Array(w * h);
+  const r = Math.floor(kernel.length / 2);
+
+  // 横方向
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let sum = 0, wsum = 0;
+      for (let k = -r; k <= r; k++) {
+        const xx = clamp(x + k, 0, w - 1);
+        sum  += src[y * w + xx] * kernel[k + r];
+        wsum += kernel[k + r];
+      }
+      tmp[y * w + x] = sum / wsum;
+    }
+  }
+  // 縦方向
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let sum = 0, wsum = 0;
+      for (let k = -r; k <= r; k++) {
+        const yy = clamp(y + k, 0, h - 1);
+        sum  += tmp[yy * w + x] * kernel[k + r];
+        wsum += kernel[k + r];
+      }
+      out[y * w + x] = Math.round(sum / wsum);
+    }
+  }
+  return out;
+}
+
+function buildGaussKernel(sigma) {
+  const r = Math.ceil(sigma * 3);
+  const k = [];
+  for (let i = -r; i <= r; i++) k.push(Math.exp(-(i*i) / (2*sigma*sigma)));
+  return k;
+}
+
+/**
+ * Sauvola 適応的二値化
+ * T(x,y) = mean(x,y) * [1 + k * (std(x,y)/R - 1)]
+ * インテグラルイメージで O(n) 実装
+ */
+function sauvolaBinarize(gray, w, h, radius, k) {
+  const out   = new Uint8Array(w * h);
+  const ii    = new Float64Array((w+1) * (h+1)); // インテグラルイメージ（和）
+  const ii2   = new Float64Array((w+1) * (h+1)); // インテグラルイメージ（二乗和）
+
+  for (let y = 1; y <= h; y++) {
+    for (let x = 1; x <= w; x++) {
+      const v = gray[(y-1)*w + (x-1)];
+      ii [y*(w+1)+x] = v     + ii [(y-1)*(w+1)+x] + ii [y*(w+1)+(x-1)] - ii [(y-1)*(w+1)+(x-1)];
+      ii2[y*(w+1)+x] = v*v   + ii2[(y-1)*(w+1)+x] + ii2[y*(w+1)+(x-1)] - ii2[(y-1)*(w+1)+(x-1)];
+    }
+  }
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const x1 = Math.max(0, x - radius),   y1 = Math.max(0, y - radius);
+      const x2 = Math.min(w - 1, x + radius), y2 = Math.min(h - 1, y + radius);
+      const count = (x2 - x1 + 1) * (y2 - y1 + 1);
+
+      const s  = ii [(y2+1)*(w+1)+(x2+1)] - ii [(y1)*(w+1)+(x2+1)] - ii [(y2+1)*(w+1)+(x1)] + ii [y1*(w+1)+x1];
+      const s2 = ii2[(y2+1)*(w+1)+(x2+1)] - ii2[(y1)*(w+1)+(x2+1)] - ii2[(y2+1)*(w+1)+(x1)] + ii2[y1*(w+1)+x1];
+      const mean = s / count;
+      const variance = Math.max(0, s2 / count - mean * mean);
+      const std = Math.sqrt(variance);
+
+      // Sauvola 閾値
+      const threshold = mean * (1 + k * (std / 128 - 1));
+      out[y * w + x] = gray[y * w + x] >= threshold ? 255 : 0;
+    }
+  }
+  return out;
+}
+
+function clamp(v, lo = 0, hi = 255) { return Math.min(hi, Math.max(lo, v)); }
+
+// ══════════════════════════════════════════════════
+// OCR（② jpn_vert + ③ 前処理統合版）
 // ══════════════════════════════════════════════════
 async function startOCR() {
   show('step-progress');
   hide('step-error');
   try {
-    // 縦書き名刺は PSM 5（縦書き均一ブロック）、横書きは PSM 3（全自動）
-    const psm = cardOrientation === 'portrait' ? '5' : '3';
+    const isPortrait = cardOrientation === 'portrait';
 
-    const worker = await Tesseract.createWorker(['jpn', 'eng'], 1, {
+    // ─── Step A: 前処理 ───────────────────────────
+    setProgress(5, '画像を前処理中...');
+    const processedData = await preprocessImage(currentImageData, isPortrait);
+
+    // ─── Step B: OCRモデル選択 ────────────────────
+    // 縦書き：jpn_vert + jpn（ただし前処理で横回転済みなので jpn も有効）
+    // 横書き：jpn + eng
+    const langs = isPortrait
+      ? ['jpn_vert', 'jpn', 'eng']   // ② jpn_vert を追加
+      : ['jpn', 'eng'];
+
+    // 縦書き前処理で横回転済みなので PSM は両方 3（全自動）で良い
+    // ただし jpn_vert モデル使用時は PSM 5 の方が語順認識が正確
+    const psm = isPortrait ? '5' : '3';
+
+    setProgress(10, '言語モデルを読み込み中...');
+    const worker = await Tesseract.createWorker(langs, 1, {
       logger: m => {
         if (m.status === 'recognizing text') {
-          const p = Math.round(m.progress * 100);
-          $('prog-fill').style.width = p + '%';
-          $('prog-pct').textContent = p + '%';
-          $('prog-status').textContent = 'テキスト認識中...';
+          // 前処理10% + OCR90% の合算進捗
+          const ocrPct = Math.round(m.progress * 85);
+          setProgress(10 + ocrPct, 'テキスト認識中...');
         } else if (m.status === 'loading language traineddata') {
-          $('prog-status').textContent = '言語データ読み込み中...';
+          setProgress(10, `言語データ読み込み中 (${langs.join(', ')})...`);
+        } else if (m.status === 'initializing api') {
+          setProgress(10, 'OCRエンジン初期化中...');
         }
       }
     });
-    await worker.setParameters({ tessedit_pageseg_mode: psm });
-    const { data: { text } } = await worker.recognize(currentImageData);
+
+    await worker.setParameters({
+      tessedit_pageseg_mode:      psm,
+      preserve_interword_spaces:  '1',  // 単語間スペース保持（後で除去）
+    });
+
+    const { data: { text } } = await worker.recognize(processedData);
     await worker.terminate();
+
+    setProgress(100, '完了');
     hide('step-progress');
 
     const cleaned = cleanText(text);
@@ -551,9 +755,15 @@ async function startOCR() {
     show('step-classify');
   } catch(err) {
     hide('step-progress');
-    showError('OCR処理中にエラーが発生しました。もう一度お試しください。');
+    showError('OCR処理中にエラーが発生しました。もう一度お試しください。<br><small>' + err.message + '</small>');
     show('step-input');
   }
+}
+
+function setProgress(pct, label) {
+  $('prog-fill').style.width = pct + '%';
+  $('prog-pct').textContent  = pct + '%';
+  $('prog-status').textContent = label;
 }
 
 // ══════════════════════════════════════════════════
