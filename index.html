@@ -801,6 +801,9 @@ function correctOcrErrors(line) {
 
   // ── 都道府県・住所の誤認識 ───────────────────────
   line = line
+    // 〒の誤認識：T/丁/亍 + 数字パターンを〒に統一
+    .replace(/^[T丁亍](\d{3})\s*[-－ー]\s*(\d{4})/,      '〒$1-$2')  // 行頭
+    .replace(/(?<![A-Za-z])[T丁亍](\d{3})\s*[-－ー]\s*(\d{4})/g, '〒$1-$2')  // 行中
     .replace(/〒\s*(\d{3})\s*[－ー―-]\s*(\d{4})/g, '〒$1-$2')
     .replace(/東[京尿]都/g, '東京都')
     .replace(/大[阪阿]府/g, '大阪府')
@@ -1108,6 +1111,9 @@ const RULES = {
       if (/^[\u3040-\u30FF]{2,6}[\s　]+[\u3040-\u30FF]{2,6}$/.test(s)) return true;
       // 英語名（各種大文字パターン）
       if (looksLikeEnglishName(s)) return true;
+      // ⑤ 姓名辞書：既知の苗字で始まる行
+      if (JP_SURNAMES.some(n => s.startsWith(n)) && s.length <= 10) return true;
+      if (EN_SURNAMES.some(n => s.toLowerCase().endsWith(' ' + n.toLowerCase())) && looksLikeEnglishName(s)) return true;
       return false;
     },
     weak: l => {
@@ -1115,6 +1121,8 @@ const RULES = {
       if (s.length > 20 || s.includes('@')) return false;
       // 日本語名：漢字・かな2〜8文字
       if (/^[\u4E00-\u9FFF\u3040-\u30FF]{2,8}$/.test(s)) return true;
+      // ⑤ 苗字辞書弱マッチ：既知苗字で始まる短い行
+      if (JP_SURNAMES.some(n => s.startsWith(n)) && s.length <= 8) return true;
       // 英語名的な2単語（大文字小文字問わず）
       if (/^[a-zA-Z]{2,}[\s]+[a-zA-Z]{2,}$/.test(s) && s.split(/\s+/).length === 2) return true;
       return false;
@@ -1130,6 +1138,51 @@ const RULES = {
     }
   }
 };
+
+// ── ⑤ 姓名辞書（日本語苗字トップ300・英語頻出姓） ─────────
+const JP_SURNAMES = [
+  '佐藤','鈴木','高橋','田中','伊藤','渡辺','山本','中村','小林','加藤',
+  '吉田','山田','佐々木','山口','松本','井上','木村','林','斎藤','清水',
+  '山崎','森','池田','橋本','阿部','石川','山下','中島','前田','藤田',
+  '小川','後藤','岡田','長谷川','石井','村上','近藤','坂本','遠藤','青木',
+  '藤井','西村','福田','太田','三浦','藤原','岡本','松田','中川','中野',
+  '原田','小野','田村','竹内','金子','和田','中山','上田','原','内田',
+  '高木','安藤','島田','谷口','大野','丸山','今井','高田','工藤','横山',
+  '宮崎','河野','大塚','宮本','武田','村田','堀','上野','松井','永井',
+  '菊地','杉山','小島','千葉','川口','新井','飯田','矢野','野口','栗原',
+  '菅原','浜田','小松','西田','辻','平野','渡部','古川','市川','東','大西',
+  '星','川上','土屋','久保','野村','平田','本田','黒田','大橋','吉川',
+  '山内','城','望月','中西','落合','奥田','水野','野田','石田','春日',
+  '尾崎','久保田','松尾','岩崎','関','南','関口','長田','小林','片山',
+  '田口','吉野','樋口','岩田','秋山','北村','神田','北川','白石','大森',
+];
+const EN_SURNAMES = [
+  'Smith','Johnson','Williams','Brown','Jones','Miller','Davis','Wilson',
+  'Moore','Taylor','Anderson','Thomas','Jackson','White','Harris','Martin',
+  'Thompson','Garcia','Martinez','Robinson','Clark','Rodriguez','Lewis',
+  'Lee','Walker','Hall','Allen','Young','Hernandez','King','Wright',
+  'Lopez','Hill','Scott','Green','Adams','Baker','Gonzalez','Nelson',
+  'Carter','Mitchell','Perez','Roberts','Turner','Phillips','Campbell',
+  'Parker','Evans','Edwards','Collins','Stewart','Sanchez','Morris',
+  'Rogers','Reed','Cook','Morgan','Bell','Murphy','Bailey','Rivera',
+  'Cooper','Richardson','Cox','Howard','Ward','Torres','Peterson','Gray',
+  'Ramirez','James','Watson','Brooks','Kelly','Sanders','Price','Bennett',
+  'Wood','Barnes','Ross','Henderson','Coleman','Jenkins','Perry','Powell',
+  'Long','Patterson','Hughes','Flores','Washington','Butler','Simmons',
+  // 日本系英語姓
+  'Tanaka','Suzuki','Sato','Watanabe','Ito','Yamamoto','Nakamura','Kobayashi',
+  'Kato','Yoshida','Yamada','Sasaki','Yamaguchi','Matsumoto','Inoue','Kimura',
+  'Hayashi','Saito','Shimizu','Yamazaki','Mori','Ikeda','Hashimoto','Abe',
+];
+
+// ── 電話番号種別判定ヘルパー ─────────────────────────────
+function classifyPhoneType(raw) {
+  const prefix = raw.toUpperCase();
+  if (/(?:FAX|ファックス|ＦＡＸ)\s*[:/：]/.test(prefix)) return 'fax';
+  const num = normalizePhoneLine(raw).replace(/[\s\-]/g, '');
+  if (/^(090|080|070|050)\d{8}$/.test(num)) return 'mobile';
+  return 'fixed';
+}
 
 // ══════════════════════════════════════════════════
 // ④ 除外ルール（ネガティブフィルター）
@@ -1174,96 +1227,101 @@ const EXCLUDE = {
 // ══════════════════════════════════════════════════
 function classify(text) {
   const rawLines = text.split('\n').map(l => l.trim()).filter(l => l.length >= 1);
-  const result = { email:[], phone:[], address:[], company:'', name:'', title:'', other:[] };
-  const used   = new Set();
-  const n      = rawLines.length;
+  const result = {
+    email:[], phone_fixed:[], phone_fax:[], phone_mobile:[],
+    address:[], company:'', name:'', title:'', other:[]
+  };
+  const used = new Set();
+  const n    = rawLines.length;
 
-  // ── ② 位置スコア計算ヘルパー ─────────────────────
-  // 名刺の典型的なレイアウト：
-  //   上部（0〜30%）  → 会社名・ロゴ
-  //   中部（30〜60%） → 氏名・役職
-  //   下部（60〜100%）→ 電話・メール・住所
   function posRatio(i) { return n <= 1 ? 0.5 : i / (n - 1); }
   function posBonus(field, i) {
     const r = posRatio(i);
-    if (field === 'company') return r < 0.35 ? 2 : r < 0.6 ? 0 : -1;
-    if (field === 'name')    return r > 0.2 && r < 0.65 ? 2 : 0;
-    if (field === 'title')   return r > 0.25 && r < 0.7 ? 1 : 0;
-    if (field === 'phone')   return r > 0.5 ? 1 : 0;
-    if (field === 'email')   return r > 0.5 ? 1 : 0;
-    if (field === 'address') return r > 0.5 ? 1 : 0;
+    if (field === 'company')     return r < 0.35 ? 2 : r < 0.6 ? 0 : -1;
+    if (field === 'name')        return r > 0.2 && r < 0.65 ? 2 : 0;
+    if (field === 'title')       return r > 0.25 && r < 0.7 ? 1 : 0;
+    if (/phone/.test(field))     return r > 0.5 ? 1 : 0;
+    if (field === 'email')       return r > 0.5 ? 1 : 0;
+    if (field === 'address')     return r > 0.5 ? 1 : 0;
     return 0;
   }
-
-  // 前後行の文脈を使った補助スコア
   function contextBonus(field, i) {
-    const prev = i > 0     ? rawLines[i-1] : '';
-    const next = i < n-1   ? rawLines[i+1] : '';
+    const prev = i > 0   ? rawLines[i-1] : '';
+    const next = i < n-1 ? rawLines[i+1] : '';
     if (field === 'name') {
-      // 直前に会社名・直後に役職があれば氏名スコア上昇
       if (/株式会社|有限会社|合同会社/.test(prev)) return 2;
       if (RULES.title.strong(next))               return 2;
     }
     if (field === 'title') {
-      // 直前が氏名候補なら役職スコア上昇
       if (RULES.name.strong(prev) || looksLikeEnglishName(prev)) return 2;
     }
     if (field === 'address') {
-      // 直前が郵便番号行なら住所スコア上昇
       if (/〒\d{3}-\d{4}/.test(prev)) return 3;
       if (RULES.address.strong(prev)) return 2;
     }
     return 0;
   }
 
-  // ── ③ 住所の複数行マージ ──────────────────────────
-  // 郵便番号行を起点に直後の行を最大3行まで結合する
+  // ③ 住所の複数行マージ
   function mergeAddressLines(startIdx) {
     const parts = [rawLines[startIdx]];
     let j = startIdx + 1;
     while (j < n && j <= startIdx + 3) {
       const next = rawLines[j];
-      // 結合候補：住所継続行の条件
       const isContinue =
         /[都道府県市区町村]|丁目|番地|号|ビル|タワー|棟|階|号室/.test(next) ||
-        /^[\d\-\s]+$/.test(next)   ||   // 番地のみの行
-        /^[A-Za-z\d\s,.-]+$/.test(next) // 英字住所の続き
-      ;
-      // 次行が別フィールドの強ルールにマッチしたら結合停止
+        /^[\d\-\s]+$/.test(next) || /^[A-Za-z\d\s,.\-]+$/.test(next);
       const isNewField =
-        RULES.email.strong(next) ||
-        RULES.phone.strong(next) ||
-        RULES.company.strong(next) ||
-        RULES.title.strong(next);
+        RULES.email.strong(next) || RULES.phone.strong(next) ||
+        RULES.company.strong(next) || RULES.title.strong(next);
       if (!isContinue || isNewField) break;
-      parts.push(next);
-      used.add(j);
-      j++;
+      parts.push(next); used.add(j); j++;
     }
     return parts.join(' ');
   }
 
-  // ────────────────────────────────────────────────
-  // PASS 1 — 強ルール + 位置ボーナス + 除外フィルター
-  // ────────────────────────────────────────────────
+  // ③ 会社名の複数行マージ
+  function mergeCompanyLines(startIdx) {
+    const parts = [rawLines[startIdx]];
+    let j = startIdx + 1;
+    // 直後1行だけ：短い行で他フィールドでなければ社名の続きと判断
+    if (j < n) {
+      const next = rawLines[j];
+      const isNewField =
+        RULES.email.strong(next) || RULES.phone.strong(next) ||
+        RULES.address.strong(next) || RULES.name.strong(next) ||
+        RULES.title.strong(next);
+      const looksLikeContinue = next.length > 0 && next.length < 30 &&
+        !isNewField && !/[@\d{4,}]/.test(next);
+      // 株式会社が次行にある場合も結合
+      if (looksLikeContinue || /株式会社|有限会社|合同会社/.test(next)) {
+        parts.push(next); used.add(j);
+      }
+    }
+    return parts.join(' ');
+  }
+
+  // ── PASS 1: 強ルール ──────────────────────────────
   for (const [fld, rule] of Object.entries(RULES)) {
     for (let i = 0; i < n; i++) {
       if (used.has(i) || !rule.strong(rawLines[i])) continue;
       const l = rawLines[i];
-
-      // 除外フィルター適用
       if (EXCLUDE[fld] && EXCLUDE[fld](l)) continue;
-
-      // スコア計算（強ルール基準点 = 3）
       const score = 3 + posBonus(fld, i) + contextBonus(fld, i);
-      if (score < 2) continue; // 位置が強く外れたら保留
+      if (score < 2) continue;
 
-      // 住所は複数行マージ
-      if (fld === 'address') {
-        const merged = mergeAddressLines(i);
-        result.address.push(merged);
-      } else if (fld === 'email' || fld === 'phone') {
-        result[fld].push(...rule.extract(l));
+      if (fld === 'phone') {
+        // 電話番号を種別ごとに振り分け
+        rule.extract(l).forEach(p => {
+          const t = classifyPhoneType(l);
+          result['phone_' + t].push(p);
+        });
+      } else if (fld === 'address') {
+        result.address.push(mergeAddressLines(i));
+      } else if (fld === 'company') {
+        if (!result.company) result.company = mergeCompanyLines(i);
+      } else if (fld === 'email') {
+        result.email.push(...rule.extract(l));
       } else {
         if (!result[fld]) result[fld] = rule.extract(l)[0];
       }
@@ -1271,92 +1329,80 @@ function classify(text) {
     }
   }
 
-  // ────────────────────────────────────────────────
-  // PASS 2 — 弱ルール（未分類のみ・除外フィルター適用）
-  // ────────────────────────────────────────────────
+  // ── PASS 2: 弱ルール ──────────────────────────────
   for (const [fld, rule] of Object.entries(RULES)) {
     if (!rule.weak) continue;
     for (let i = 0; i < n; i++) {
       if (used.has(i) || !rule.weak(rawLines[i])) continue;
       const l = rawLines[i];
       if (EXCLUDE[fld] && EXCLUDE[fld](l)) continue;
-
       const score = 2 + posBonus(fld, i) + contextBonus(fld, i);
       if (score < 2) continue;
 
-      if (fld === 'address') {
-        const merged = mergeAddressLines(i);
-        result.address.push(merged); used.add(i);
-      } else if (fld === 'email' || fld === 'phone') {
-        result[fld].push(...rule.extract(l)); used.add(i);
+      if (fld === 'phone') {
+        rule.extract(l).forEach(p => {
+          const t = classifyPhoneType(l);
+          result['phone_' + t].push(p);
+        });
+        used.add(i);
+      } else if (fld === 'address') {
+        result.address.push(mergeAddressLines(i)); used.add(i);
+      } else if (fld === 'email') {
+        result.email.push(...rule.extract(l)); used.add(i);
       } else if (!result[fld]) {
         result[fld] = rule.extract(l)[0]; used.add(i);
       }
     }
   }
 
-  // ────────────────────────────────────────────────
-  // PASS 3 — フォールバック再分類（other候補を再チェック）
-  // ────────────────────────────────────────────────
+  // ── PASS 3: フォールバック再分類 ─────────────────
   const fallbackLines = [];
   for (let i = 0; i < n; i++) {
     if (used.has(i)) continue;
     const l = rawLines[i];
     if (l.length < 2 || /^[\s\-_=*#|.。、…]+$/.test(l)) continue;
-
     let assigned = false;
 
-    // 数字が多い未分類行 → 電話番号の再試行
     if (!assigned && /\d{3,}/.test(l) && l.replace(/\D/g,'').length >= 8) {
       const n2 = normalizePhoneLine(l);
       if (/0\d{8,10}/.test(n2.replace(/\D/g,''))) {
-        result.phone.push(n2.replace(/[^0-9+\-]/g,'').replace(/^(\d{2,4})(\d{4})(\d{4})$/,'$1-$2-$3'));
+        const t = classifyPhoneType(l);
+        result['phone_' + t].push(n2);
         used.add(i); assigned = true;
       }
     }
-
-    // 漢字4文字以内・単独行 → 氏名の再試行（除外フィルター通過後）
     if (!assigned && !result.name && /^[\u4E00-\u9FFF\u3040-\u30FF]{2,5}$/.test(l)) {
-      if (!EXCLUDE.name(l)) {
-        result.name = l; used.add(i); assigned = true;
-      }
+      if (!EXCLUDE.name(l)) { result.name = l; used.add(i); assigned = true; }
     }
-
-    // 「部」「課」「室」を含む → 役職に追加
     if (!assigned && !result.title &&
         /(?:営業|技術|開発|総務|人事|経営|企画|管理|購買|物流|品質|研究|広報|法務|財務|情報)(?:部|課|室|係|本部|グループ|チーム)/.test(l)) {
-      if (!EXCLUDE.title(l)) {
-        result.title = l; used.add(i); assigned = true;
-      }
+      if (!EXCLUDE.title(l)) { result.title = l; used.add(i); assigned = true; }
     }
-
-    // http/www を含む → other（URLとして保持）
     if (!assigned && /https?:\/\/|www\./i.test(l)) {
       result.other.push(l); used.add(i); assigned = true;
     }
-
     if (!assigned) fallbackLines.push(l);
   }
 
-  // ────────────────────────────────────────────────
-  // PASS 4 — 残り → other（ノイズ除去後）
-  // ────────────────────────────────────────────────
+  // ── PASS 4: 残り → other ─────────────────────────
   for (const l of fallbackLines) {
-    // ノイズ行の除外
-    if (l.length > 80) continue;                     // 長すぎる
-    if (/^[・•◆◇■□▶▷]+$/.test(l)) continue;       // 記号のみ
-    if (/^[\d\s\-\.]{1,3}$/.test(l)) continue;       // 1〜3文字の数字（ページ番号等）
-    if (/^(?:E[-\s]?mail|Mail|ホームページ|HP|URL|Website|Web)\s*[:/：]?\s*$/i.test(l)) continue; // ラベルのみ行
+    if (l.length > 80) continue;
+    if (/^[・•◆◇■□▶▷]+$/.test(l)) continue;
+    if (/^[\d\s\-\.]{1,3}$/.test(l)) continue;
+    if (/^(?:E[-\s]?mail|Mail|ホームページ|HP|URL|Website|Web)\s*[:/：]?\s*$/i.test(l)) continue;
     result.other.push(l);
   }
 
-  // ── 後処理：重複除去 + 電話番号フォーマット統一 ──
-  ['email','phone','address','other'].forEach(k => {
-    result[k] = [...new Set(result[k])];
-  });
-
-  // 電話番号：正規化して重複排除（ハイフン有無の揺れを吸収）
-  result.phone = deduplicatePhones(result.phone);
+  // ── 後処理：重複除去 ─────────────────────────────
+  // ⑦ メール：小文字化して重複排除
+  result.email = [...new Map(result.email.map(e => [e.toLowerCase(), e])).values()];
+  // ⑦ 電話：ハイフン除去後に比較
+  result.phone_fixed  = deduplicatePhones(result.phone_fixed);
+  result.phone_fax    = deduplicatePhones(result.phone_fax);
+  result.phone_mobile = deduplicatePhones(result.phone_mobile);
+  // ⑦ 住所：全角数字を半角化して比較
+  result.address = deduplicateAddresses(result.address);
+  result.other   = [...new Set(result.other)];
 
   return result;
 }
@@ -1366,6 +1412,20 @@ function deduplicatePhones(phones) {
   const seen = new Set();
   return phones.filter(p => {
     const key = p.replace(/[\s\-]/g, '');
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+}
+
+// ⑦ 住所の重複除去（全角数字→半角化後に比較）
+function deduplicateAddresses(addrs) {
+  const normalize = a => a
+    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/[\s　]/g, '')
+    .toLowerCase();
+  const seen = new Set();
+  return addrs.filter(a => {
+    const key = normalize(a);
     if (seen.has(key)) return false;
     seen.add(key); return true;
   });
@@ -1381,13 +1441,15 @@ function reclassify() {
 // EDITOR UI
 // ══════════════════════════════════════════════════
 const FIELDS = [
-  { key:'company', label:'会社名',        icon:'🏢', multi:false },
-  { key:'name',    label:'氏名',          icon:'👤', multi:false },
-  { key:'title',   label:'役職',          icon:'💼', multi:false },
-  { key:'phone',   label:'電話番号',      icon:'📞', multi:true  },
-  { key:'email',   label:'メールアドレス', icon:'📧', multi:true  },
-  { key:'address', label:'住所',          icon:'📍', multi:true  },
-  { key:'other',   label:'その他',        icon:'📝', multi:true  },
+  { key:'company',      label:'会社名',         icon:'🏢', multi:false },
+  { key:'name',         label:'氏名',           icon:'👤', multi:false },
+  { key:'title',        label:'役職',           icon:'💼', multi:false },
+  { key:'phone_fixed',  label:'固定電話（通話）', icon:'📞', multi:true  },
+  { key:'phone_fax',    label:'FAX',            icon:'🖨', multi:true  },
+  { key:'phone_mobile', label:'携帯番号',        icon:'📱', multi:true  },
+  { key:'email',        label:'メールアドレス',  icon:'📧', multi:true  },
+  { key:'address',      label:'住所',           icon:'📍', multi:true  },
+  { key:'other',        label:'その他・タグ',    icon:'🏷', multi:true  },
 ];
 
 function renderEditor(data) {
@@ -1447,65 +1509,120 @@ function initials(name) {
 }
 
 const IC = {
-  tel:  '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.6 1.21h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 8.91a16 16 0 0 0 6 6l.91-.91a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7a2 2 0 0 1 1.72 2.02z"/>',
-  mail: '<path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>',
-  map:  '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
-  tag:  '<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>',
+  tel:    '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.6 1.21h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 8.91a16 16 0 0 0 6 6l.91-.91a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7a2 2 0 0 1 1.72 2.02z"/>',
+  fax:    '<rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 2v5M8 2v5M2 12h20"/><path d="M6 16h4M6 19h8"/>',
+  mobile: '<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12" y2="18"/>',
+  mail:   '<path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>',
+  map:    '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
+  tag:    '<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>',
 };
 function frow(ic, label, content) {
   return `<div class="field"><div class="field-ic"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:var(--text3);fill:none;stroke-width:1.8">${IC[ic]}</svg></div><div style="flex:1;min-width:0"><div class="f-label">${label}</div>${content}</div></div>`;
 }
 
+// タグクリックで検索フィールドにセット
+function searchByTag(tag) {
+  const s = $('search');
+  if (!s) return;
+  s.value = tag;
+  renderCards();
+  s.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
 function renderCards() {
-  const q = ($('search')?.value||'').toLowerCase();
-  const filtered = q ? cards.filter(c=>
-    (c.name||'').toLowerCase().includes(q) ||
-    (c.company||'').toLowerCase().includes(q) ||
-    (c.email||[]).join(' ').toLowerCase().includes(q) ||
-    (c.rawText||'').toLowerCase().includes(q)
-  ) : cards;
+  const raw = ($('search')?.value || '').trim();
+  const q   = raw.toLowerCase();
+
+  // タグ検索：#タグ または 通常テキスト両対応
+  const filtered = q ? cards.filter(c => {
+    const allOther = (c.other || []).join(' ').toLowerCase();
+    return (
+      (c.name        || '').toLowerCase().includes(q) ||
+      (c.company     || '').toLowerCase().includes(q) ||
+      (c.title       || '').toLowerCase().includes(q) ||
+      (c.email       || []).join(' ').toLowerCase().includes(q) ||
+      (c.phone_fixed || []).join(' ').includes(q) ||
+      (c.phone_mobile|| []).join(' ').includes(q) ||
+      (c.phone_fax   || []).join(' ').includes(q) ||
+      (c.address     || []).join(' ').toLowerCase().includes(q) ||
+      allOther.includes(q) ||
+      (c.rawText     || '').toLowerCase().includes(q)
+    );
+  }) : cards;
 
   $('card-meta').textContent = cards.length + '件';
   $('export-area').style.display = cards.length > 0 ? 'block' : 'none';
 
   const list = $('cards-list');
   if (filtered.length === 0) {
-    list.innerHTML = `<div class="empty"><div class="empty-icon">📋</div><div class="empty-title">${cards.length===0?'名刺がまだ登録されていません':'検索結果がありません'}</div><div class="empty-sub">${cards.length===0?'左パネルから名刺を読み込んでください':''}</div></div>`;
+    list.innerHTML = `<div class="empty"><div class="empty-icon">📋</div>
+      <div class="empty-title">${cards.length === 0 ? '名刺がまだ登録されていません' : '検索結果がありません'}</div>
+      <div class="empty-sub">${cards.length === 0 ? '左パネルから名刺を読み込んでください' :
+        q ? `「${raw}」に一致する名刺が見つかりませんでした` : ''}</div></div>`;
     return;
   }
 
+  // 検索ヒット件数バッジ
+  if (q && filtered.length < cards.length) {
+    $('card-meta').textContent = `${filtered.length} / ${cards.length}件`;
+  }
+
   list.innerHTML = filtered.map(c => {
-    const phones = (c.phone||[]).filter(Boolean);
-    const emails = (c.email||[]).filter(Boolean);
-    const addrs  = (c.address||[]).filter(Boolean);
-    const others = (c.other||[]).filter(Boolean);
+    const fixed   = (c.phone_fixed  || []).filter(Boolean);
+    const fax     = (c.phone_fax    || []).filter(Boolean);
+    const mobile  = (c.phone_mobile || []).filter(Boolean);
+    // 旧データ互換：phone フィールドが残っていれば fixed 扱い
+    const legacyPhone = (c.phone || []).filter(Boolean);
+    const allFixed = [...fixed, ...legacyPhone];
+
+    const emails  = (c.email   || []).filter(Boolean);
+    const addrs   = (c.address || []).filter(Boolean);
+    const others  = (c.other   || []).filter(Boolean);
+
+    // タグ：クリックで検索できるチップ
+    const tagChips = others.map(o => {
+      const esc = o.replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+      return `<span class="tag" style="cursor:pointer" onclick="searchByTag('${esc}')" title="このタグで検索">${o}</span>`;
+    }).join('');
+
     const rows = [
-      phones.length ? frow('tel','電話番号', phones.map(p=>`<div class="f-val mono">${p}</div>`).join('')) : '',
-      emails.length ? frow('mail','メールアドレス', emails.map(e=>`<div class="f-val mono">${e}</div>`).join('')) : '',
-      addrs.length  ? frow('map','住所', addrs.map(a=>`<div class="f-val">${a}</div>`).join('')) : '',
-      others.length ? frow('tag','その他', `<div class="tag-list">${others.map(o=>`<span class="tag">${o}</span>`).join('')}</div>`) : '',
+      allFixed.length  ? frow('tel',    '固定電話',      allFixed.map(p  => `<div class="f-val mono">${p}</div>`).join('')) : '',
+      fax.length       ? frow('fax',    'FAX',           fax.map(p       => `<div class="f-val mono">${p}</div>`).join('')) : '',
+      mobile.length    ? frow('mobile', '携帯番号',      mobile.map(p    => `<div class="f-val mono">${p}</div>`).join('')) : '',
+      emails.length    ? frow('mail',   'メールアドレス', emails.map(e   => `<div class="f-val mono">${e}</div>`).join('')) : '',
+      addrs.length     ? frow('map',    '住所',          addrs.map(a     => `<div class="f-val">${a}</div>`).join('')) : '',
+      others.length    ? frow('tag',    'その他・タグ',  `<div class="tag-list">${tagChips}</div>`) : '',
     ].filter(Boolean).join('');
+
     return `<div class="card">
       <div class="card-head">
         <div class="avatar">${initials(c.name)}</div>
-        <div style="flex:1;min-width:0"><div class="card-name">${c.name||'（氏名不明）'}</div><div class="card-pos">${c.title||''}</div></div>
-        ${c.company?`<div class="company-pill" title="${c.company}">${c.company}</div>`:''}
+        <div style="flex:1;min-width:0">
+          <div class="card-name">${c.name || '（氏名不明）'}</div>
+          <div class="card-pos">${c.title || ''}</div>
+        </div>
+        ${c.company ? `<div class="company-pill" title="${c.company}">${c.company}</div>` : ''}
       </div>
-      <div>${rows||`<div class="field"><span style="font-size:12px;color:var(--text3)">連絡先情報が見つかりませんでした</span></div>`}</div>
+      <div>${rows || `<div class="field"><span style="font-size:12px;color:var(--text3)">連絡先情報が見つかりませんでした</span></div>`}</div>
       <div class="card-foot">
         <span class="card-ts">${c.ts}</span>
         <div style="display:flex;gap:6px">
-          <button class="btn-sm" onclick="showRaw(${c.id})"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>OCR原文</button>
-          <button class="btn-sm btn-danger" onclick="deleteCard(${c.id})"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>削除</button>
+          <button class="btn-sm" onclick="showRaw(${c.id})">
+            <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>OCR原文
+          </button>
+          <button class="btn-sm btn-danger" onclick="deleteCard(${c.id})">
+            <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>削除
+          </button>
         </div>
       </div>
     </div>`;
   }).join('');
 }
+
 function showRaw(id) {
-  const c = cards.find(x=>x.id===id); if (!c) return;
-  const w = window.open('','_blank','width=520,height=440');
-  w.document.write(`<pre style="font-family:monospace;padding:16px;white-space:pre-wrap;word-break:break-word;font-size:13px">${c.rawText||''}</pre>`);
+  const c = cards.find(x => x.id === id); if (!c) return;
+  const w = window.open('', '_blank', 'width=520,height=440');
+  w.document.write(`<pre style="font-family:monospace;padding:16px;white-space:pre-wrap;word-break:break-word;font-size:13px">${c.rawText || ''}</pre>`);
   w.document.close();
 }
 
@@ -1513,47 +1630,69 @@ function showRaw(id) {
 // EXPORT
 // ══════════════════════════════════════════════════
 function buildRows() {
-  return cards.map(c => ({
-    '登録日時':         c.ts||'',
-    '会社名':           c.company||'',
-    '氏名':             c.name||'',
-    '役職':             c.title||'',
-    '電話番号1':        (c.phone||[])[0]||'',
-    '電話番号2':        (c.phone||[])[1]||'',
-    'メールアドレス1':  (c.email||[])[0]||'',
-    'メールアドレス2':  (c.email||[])[1]||'',
-    '住所':             (c.address||[]).join(' '),
-    'その他':           (c.other||[]).join(' / '),
-  }));
+  return cards.map(c => {
+    // 旧データ互換（phone → phone_fixed）
+    const fixed  = [...(c.phone_fixed  || []), ...(c.phone || [])];
+    const fax    =   (c.phone_fax    || []);
+    const mobile =   (c.phone_mobile || []);
+    return {
+      '登録日時':         c.ts || '',
+      '会社名':           c.company || '',
+      '氏名':             c.name || '',
+      '役職':             c.title || '',
+      '固定電話1':        fixed[0]  || '',
+      '固定電話2':        fixed[1]  || '',
+      'FAX':              fax[0]    || '',
+      '携帯番号':         mobile[0] || '',
+      'メールアドレス1':  (c.email || [])[0] || '',
+      'メールアドレス2':  (c.email || [])[1] || '',
+      '住所':             (c.address || []).join(' '),
+      'タグ・その他':     (c.other   || []).join(' / '),
+    };
+  });
 }
+
 function exportExcel() {
   if (!cards.length) { alert('エクスポートする名刺がありません。'); return; }
   const rows = buildRows();
   const ws = XLSX.utils.json_to_sheet(rows);
-  ws['!cols'] = [{wch:18},{wch:26},{wch:14},{wch:20},{wch:16},{wch:16},{wch:30},{wch:30},{wch:36},{wch:28}];
+  ws['!cols'] = [
+    {wch:18},{wch:26},{wch:14},{wch:22},
+    {wch:16},{wch:16},{wch:16},{wch:16},
+    {wch:30},{wch:30},{wch:36},{wch:32}
+  ];
   const range = XLSX.utils.decode_range(ws['!ref']);
   ws['!autofilter'] = { ref: XLSX.utils.encode_range({s:{r:0,c:0},e:{r:0,c:range.e.c}}) };
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, '名刺リスト');
   const meta = XLSX.utils.aoa_to_sheet([
     ['エクスポート日時', new Date().toLocaleString('ja-JP')],
-    ['件数', cards.length+'件'],['作成ツール','名刺スキャナー（ブラウザ）'],
+    ['件数', cards.length + '件'],
+    ['作成ツール', '名刺スキャナー（ブラウザ）'],
   ]);
   meta['!cols'] = [{wch:20},{wch:32}];
   XLSX.utils.book_append_sheet(wb, meta, '概要');
-  XLSX.writeFile(wb, '名刺リスト_'+new Date().toLocaleDateString('ja-JP').replace(/\//g,'-')+'.xlsx');
+  XLSX.writeFile(wb, '名刺リスト_' + new Date().toLocaleDateString('ja-JP').replace(/\//g,'-') + '.xlsx');
 }
+
 function exportCSV() {
   if (!cards.length) { alert('エクスポートする名刺がありません。'); return; }
   const rows = buildRows(), headers = Object.keys(rows[0]);
-  const csv = '\uFEFF' + [headers.map(h=>`"${h}"`).join(','), ...rows.map(r=>headers.map(h=>`"${String(r[h]).replace(/"/g,'""')}"`).join(','))].join('\r\n');
-  const a = Object.assign(document.createElement('a'),{href:URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8;'})),download:'名刺リスト_'+new Date().toLocaleDateString('ja-JP').replace(/\//g,'-')+'.csv'});
+  const csv = '\uFEFF' + [
+    headers.map(h => `"${h}"`).join(','),
+    ...rows.map(r => headers.map(h => `"${String(r[h]).replace(/"/g,'""')}"`).join(','))
+  ].join('\r\n');
+  const a = Object.assign(document.createElement('a'), {
+    href: URL.createObjectURL(new Blob([csv], {type:'text/csv;charset=utf-8;'})),
+    download: '名刺リスト_' + new Date().toLocaleDateString('ja-JP').replace(/\//g,'-') + '.csv'
+  });
   a.click();
 }
+
 function printCards() {
   if (!cards.length) { alert('印刷する名刺がありません。'); return; }
   const rows = buildRows(), headers = Object.keys(rows[0]);
-  const w = window.open('','_blank');
+  const w = window.open('', '_blank');
   w.document.write(`<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><title>名刺リスト</title><style>
 body{font-family:'Hiragino Sans',sans-serif;font-size:11px;margin:16px;color:#111}
 h2{font-size:14px;margin-bottom:4px}p{font-size:11px;color:#666;margin-bottom:14px}
@@ -1563,11 +1702,12 @@ td{border:1px solid #ddd;padding:5px 8px;vertical-align:top}
 tr:nth-child(even) td{background:#f5f8f5}
 @media print{@page{margin:10mm}}
 </style></head><body>
-<h2>名刺リスト</h2><p>${new Date().toLocaleString('ja-JP')} 時点 ／ ${cards.length}件</p>
+<h2>名刺リスト</h2>
+<p>${new Date().toLocaleString('ja-JP')} 時点 ／ ${cards.length}件</p>
 <table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
-<tbody>${rows.map(r=>`<tr>${headers.map(h=>`<td>${r[h]||''}</td>`).join('')}</tr>`).join('')}</tbody></table>
-</body></html>`);
-  w.document.close(); setTimeout(()=>w.print(),400);
+<tbody>${rows.map(r=>`<tr>${headers.map(h=>`<td>${r[h]||''}</td>`).join('')}</tr>`).join('')}</tbody>
+</table></body></html>`);
+  w.document.close(); setTimeout(() => w.print(), 400);
 }
 
 renderCards();
