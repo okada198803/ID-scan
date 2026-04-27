@@ -767,17 +767,75 @@ function setProgress(pct, label) {
 }
 
 // ══════════════════════════════════════════════════
-// TEXT CLEANING  ← スペース除去エンジン
+// ⑥ OCR 誤認識補正テーブル
+// ══════════════════════════════════════════════════
+function correctOcrErrors(line) {
+  // ── 法人格の典型的な誤認識 ──────────────────────
+  line = line
+    .replace(/株[式ポポ式]\s*会\s*社|株\s*[式ポポ]\s*会社/g, '株式会社')
+    .replace(/有[限眼]\s*会\s*社/g, '有限会社')
+    .replace(/合[同司]\s*会\s*社/g, '合同会社')
+    .replace(/一[般般]\s*社[団困]\s*法[人入]/g, '一般社団法人')
+    .replace(/医[療擦]\s*法[人入]/g, '医療法人');
+
+  // ── メールアドレスの誤認識 ───────────────────────
+  line = line
+    .replace(/＠/g, '@')          // 全角@
+    .replace(/(?<=\w)[\s　]@/g, '@')
+    .replace(/@[\s　](?=\w)/g, '@')
+    .replace(/\bGmai[il1]\b/gi, 'Gmail')
+    .replace(/\byahoo\.c[o0]\.jp\b/gi, 'yahoo.co.jp')
+    .replace(/\.c[o0]m\b/gi, '.com')
+    .replace(/\.c[o0]\.jp\b/gi, '.co.jp')
+    .replace(/\.ne[t+]\b/gi, '.net');
+
+  // ── 電話番号の誤認識 ─────────────────────────────
+  line = line
+    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)) // 全角数字
+    .replace(/[Ｏｏ](?=\d)/g, '0')  // O を 0 に（電話番号文脈）
+    .replace(/(?<=\d)[Ｏｏ]/g, '0')
+    .replace(/[Ｉｌ|](?=\d)/g, '1') // I/l を 1 に（電話番号文脈）
+    .replace(/\bTEし\b/gi, 'TEL')
+    .replace(/\bＴＥＬ\b/g, 'TEL')
+    .replace(/\bＦＡＸ\b/g, 'FAX');
+
+  // ── 都道府県・住所の誤認識 ───────────────────────
+  line = line
+    .replace(/〒\s*(\d{3})\s*[－ー―-]\s*(\d{4})/g, '〒$1-$2')
+    .replace(/東[京尿]都/g, '東京都')
+    .replace(/大[阪阿]府/g, '大阪府')
+    .replace(/神[奈夾]川[県懸]/g, '神奈川県')
+    .replace(/愛[知和]県/g, '愛知県')
+    .replace(/T目/g, '丁目')
+    .replace(/番[纏]地/g, '番地');
+
+  // ── 英語の典型的な誤認識 ────────────────────────
+  line = line
+    .replace(/\b[Ii]nc[,.]?\b/g, 'Inc.')
+    .replace(/\b[Ll]td[,.]?\b/g, 'Ltd.')
+    .replace(/\b[Cc]orp[,.]?\b/g, 'Corp.')
+    .replace(/\bC[EF]O\b/g, m => m)  // CEO/CFO等は保持
+    .replace(/\b0(?=[A-Za-z])/g, 'O') // 数字0→英字O（英単語文脈）
+    .replace(/rn\b/g, 'm');            // rn → m の誤認識（Shimomura等）
+
+  return line;
+}
+
+// ══════════════════════════════════════════════════
+// TEXT CLEANING  ← スペース除去 + OCR誤認識補正
 // ══════════════════════════════════════════════════
 function cleanText(raw) {
-  const JA = '[\u3000-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]'; // 漢字・かな・全角
-  const KA = '[\u30A0-\u30FF]';  // カタカナ
-  const HI = '[\u3040-\u309F]';  // ひらがな
-  const KJ = '[\u4E00-\u9FFF]';  // 漢字
+  const JA = '[\u3000-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]';
+  const KA = '[\u30A0-\u30FF]';
+  const HI = '[\u3040-\u309F]';
+  const KJ = '[\u4E00-\u9FFF]';
 
   let lines = raw.split(/\r?\n/);
   lines = lines.map(line => {
-    // 1. 漢字・かな・全角文字間の半角スペース除去（OCR起因のアーティファクト）
+    // ── ⑥ OCR誤認識補正（スペース除去の前に実施） ──
+    line = correctOcrErrors(line);
+
+    // 1. 漢字・かな・全角文字間の半角スペース除去
     for (let i = 0; i < 6; i++) {
       line = line
         .replace(new RegExp('(' + JA + ') +(' + JA + ')', 'g'), '$1$2')
@@ -794,17 +852,11 @@ function cleanText(raw) {
 
     // 3. 電話番号ハイフン前後スペース除去
     line = line.replace(/(\d)\s*[-ー]\s*(\d)/g, '$1-$2');
-    line = line.replace(/(\d)\s+(\d{4})\s*[-ー]\s*(\d)/g, '$1-$2-$3');
 
     // 4. 郵便番号スペース除去
     line = line.replace(/〒\s*(\d{3})\s*[-ー]?\s*(\d{4})/g, '〒$1-$2');
 
-    // 5. 株式会社等の間スペース除去
-    line = line.replace(/株\s*式\s*会\s*社/g, '株式会社');
-    line = line.replace(/有\s*限\s*会\s*社/g, '有限会社');
-    line = line.replace(/合\s*同\s*会\s*社/g, '合同会社');
-
-    // 6. 前後トリム
+    // 5. 前後トリム
     return line.trim();
   });
 
@@ -1079,56 +1131,244 @@ const RULES = {
   }
 };
 
-function classify(text) {
-  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length >= 2);
-  const result = { email:[], phone:[], address:[], company:'', name:'', title:'', other:[] };
-  const used = new Set();
+// ══════════════════════════════════════════════════
+// ④ 除外ルール（ネガティブフィルター）
+// ── 「これは絶対に氏名・役職ではない」条件 ─────
+// ══════════════════════════════════════════════════
+const EXCLUDE = {
+  // 氏名として除外すべき行の条件
+  name: l => [
+    l.length > 20,                            // 長すぎる
+    /株式会社|有限会社|合同会社/.test(l),      // 法人格
+    /@/.test(l),                               // メール
+    /\d{4,}/.test(l),                          // 4桁以上の数字
+    /TEL|FAX|電話|〒|http|www/i.test(l),       // 連絡先系
+    /[。、！？…]/.test(l),                     // 句読点（キャッチコピー）
+    l.split(/[\s　]+/).length > 4,             // 単語5つ以上（住所・文章）
+    /部|課|室|係|局|本部|センター/.test(l) &&
+      /長$|員$|担当$/.test(l),                 // 部署+役職（役職行）
+    /都|道|府|県|市|区|町|村/.test(l) &&
+      l.length > 8,                            // 住所
+  ].some(Boolean),
 
-  // PASS 1 — 強ルール（確実マッチ）
+  // 役職として除外すべき行の条件
+  title: l => [
+    l.length > 80,
+    /@/.test(l),
+    /〒|\d{3}-\d{4}/.test(l),                 // 郵便番号
+    /^[\d\-\+\(\)]+$/.test(l),               // 数字のみ
+    l.split(/[\s　]+/).length > 6,
+  ].some(Boolean),
+
+  // 会社名として除外すべき行の条件
+  company: l => [
+    l.length > 80,
+    /@/.test(l),
+    /^[\d\-\+\(\)〒]+/.test(l),              // 数字・郵便番号で始まる
+    /\d{2,}-\d{2,}-\d{3,}/.test(l),          // 電話番号パターン
+  ].some(Boolean),
+};
+
+// ══════════════════════════════════════════════════
+// 分類メイン関数（4パス版）
+// ══════════════════════════════════════════════════
+function classify(text) {
+  const rawLines = text.split('\n').map(l => l.trim()).filter(l => l.length >= 1);
+  const result = { email:[], phone:[], address:[], company:'', name:'', title:'', other:[] };
+  const used   = new Set();
+  const n      = rawLines.length;
+
+  // ── ② 位置スコア計算ヘルパー ─────────────────────
+  // 名刺の典型的なレイアウト：
+  //   上部（0〜30%）  → 会社名・ロゴ
+  //   中部（30〜60%） → 氏名・役職
+  //   下部（60〜100%）→ 電話・メール・住所
+  function posRatio(i) { return n <= 1 ? 0.5 : i / (n - 1); }
+  function posBonus(field, i) {
+    const r = posRatio(i);
+    if (field === 'company') return r < 0.35 ? 2 : r < 0.6 ? 0 : -1;
+    if (field === 'name')    return r > 0.2 && r < 0.65 ? 2 : 0;
+    if (field === 'title')   return r > 0.25 && r < 0.7 ? 1 : 0;
+    if (field === 'phone')   return r > 0.5 ? 1 : 0;
+    if (field === 'email')   return r > 0.5 ? 1 : 0;
+    if (field === 'address') return r > 0.5 ? 1 : 0;
+    return 0;
+  }
+
+  // 前後行の文脈を使った補助スコア
+  function contextBonus(field, i) {
+    const prev = i > 0     ? rawLines[i-1] : '';
+    const next = i < n-1   ? rawLines[i+1] : '';
+    if (field === 'name') {
+      // 直前に会社名・直後に役職があれば氏名スコア上昇
+      if (/株式会社|有限会社|合同会社/.test(prev)) return 2;
+      if (RULES.title.strong(next))               return 2;
+    }
+    if (field === 'title') {
+      // 直前が氏名候補なら役職スコア上昇
+      if (RULES.name.strong(prev) || looksLikeEnglishName(prev)) return 2;
+    }
+    if (field === 'address') {
+      // 直前が郵便番号行なら住所スコア上昇
+      if (/〒\d{3}-\d{4}/.test(prev)) return 3;
+      if (RULES.address.strong(prev)) return 2;
+    }
+    return 0;
+  }
+
+  // ── ③ 住所の複数行マージ ──────────────────────────
+  // 郵便番号行を起点に直後の行を最大3行まで結合する
+  function mergeAddressLines(startIdx) {
+    const parts = [rawLines[startIdx]];
+    let j = startIdx + 1;
+    while (j < n && j <= startIdx + 3) {
+      const next = rawLines[j];
+      // 結合候補：住所継続行の条件
+      const isContinue =
+        /[都道府県市区町村]|丁目|番地|号|ビル|タワー|棟|階|号室/.test(next) ||
+        /^[\d\-\s]+$/.test(next)   ||   // 番地のみの行
+        /^[A-Za-z\d\s,.-]+$/.test(next) // 英字住所の続き
+      ;
+      // 次行が別フィールドの強ルールにマッチしたら結合停止
+      const isNewField =
+        RULES.email.strong(next) ||
+        RULES.phone.strong(next) ||
+        RULES.company.strong(next) ||
+        RULES.title.strong(next);
+      if (!isContinue || isNewField) break;
+      parts.push(next);
+      used.add(j);
+      j++;
+    }
+    return parts.join(' ');
+  }
+
+  // ────────────────────────────────────────────────
+  // PASS 1 — 強ルール + 位置ボーナス + 除外フィルター
+  // ────────────────────────────────────────────────
   for (const [fld, rule] of Object.entries(RULES)) {
-    for (let i = 0; i < lines.length; i++) {
-      if (used.has(i) || !rule.strong(lines[i])) continue;
-      const extracted = rule.extract(lines[i]);
-      if (['email','phone'].includes(fld)) {
-        result[fld].push(...extracted);
-      } else if (fld === 'address') {
-        result.address.push(...extracted);
+    for (let i = 0; i < n; i++) {
+      if (used.has(i) || !rule.strong(rawLines[i])) continue;
+      const l = rawLines[i];
+
+      // 除外フィルター適用
+      if (EXCLUDE[fld] && EXCLUDE[fld](l)) continue;
+
+      // スコア計算（強ルール基準点 = 3）
+      const score = 3 + posBonus(fld, i) + contextBonus(fld, i);
+      if (score < 2) continue; // 位置が強く外れたら保留
+
+      // 住所は複数行マージ
+      if (fld === 'address') {
+        const merged = mergeAddressLines(i);
+        result.address.push(merged);
+      } else if (fld === 'email' || fld === 'phone') {
+        result[fld].push(...rule.extract(l));
       } else {
-        if (!result[fld]) result[fld] = extracted[0];
+        if (!result[fld]) result[fld] = rule.extract(l)[0];
       }
       used.add(i);
     }
   }
 
-  // PASS 2 — 弱ルール（未分類のみ）
+  // ────────────────────────────────────────────────
+  // PASS 2 — 弱ルール（未分類のみ・除外フィルター適用）
+  // ────────────────────────────────────────────────
   for (const [fld, rule] of Object.entries(RULES)) {
     if (!rule.weak) continue;
-    for (let i = 0; i < lines.length; i++) {
-      if (used.has(i) || !rule.weak(lines[i])) continue;
-      const extracted = rule.extract(lines[i]);
+    for (let i = 0; i < n; i++) {
+      if (used.has(i) || !rule.weak(rawLines[i])) continue;
+      const l = rawLines[i];
+      if (EXCLUDE[fld] && EXCLUDE[fld](l)) continue;
+
+      const score = 2 + posBonus(fld, i) + contextBonus(fld, i);
+      if (score < 2) continue;
+
       if (fld === 'address') {
-        result.address.push(...extracted); used.add(i);
-      } else if (fld === 'email') {
-        result.email.push(...extracted); used.add(i);
-      } else if (fld === 'phone') {
-        result.phone.push(...extracted); used.add(i);
+        const merged = mergeAddressLines(i);
+        result.address.push(merged); used.add(i);
+      } else if (fld === 'email' || fld === 'phone') {
+        result[fld].push(...rule.extract(l)); used.add(i);
       } else if (!result[fld]) {
-        result[fld] = extracted[0]; used.add(i);
+        result[fld] = rule.extract(l)[0]; used.add(i);
       }
     }
   }
 
-  // PASS 3 — 残り → other
-  for (let i = 0; i < lines.length; i++) {
-    if (!used.has(i)) {
-      const l = lines[i];
-      if (l.length <= 80 && !/^[\s\-_=*#|.。、…]+$/.test(l)) result.other.push(l);
+  // ────────────────────────────────────────────────
+  // PASS 3 — フォールバック再分類（other候補を再チェック）
+  // ────────────────────────────────────────────────
+  const fallbackLines = [];
+  for (let i = 0; i < n; i++) {
+    if (used.has(i)) continue;
+    const l = rawLines[i];
+    if (l.length < 2 || /^[\s\-_=*#|.。、…]+$/.test(l)) continue;
+
+    let assigned = false;
+
+    // 数字が多い未分類行 → 電話番号の再試行
+    if (!assigned && /\d{3,}/.test(l) && l.replace(/\D/g,'').length >= 8) {
+      const n2 = normalizePhoneLine(l);
+      if (/0\d{8,10}/.test(n2.replace(/\D/g,''))) {
+        result.phone.push(n2.replace(/[^0-9+\-]/g,'').replace(/^(\d{2,4})(\d{4})(\d{4})$/,'$1-$2-$3'));
+        used.add(i); assigned = true;
+      }
     }
+
+    // 漢字4文字以内・単独行 → 氏名の再試行（除外フィルター通過後）
+    if (!assigned && !result.name && /^[\u4E00-\u9FFF\u3040-\u30FF]{2,5}$/.test(l)) {
+      if (!EXCLUDE.name(l)) {
+        result.name = l; used.add(i); assigned = true;
+      }
+    }
+
+    // 「部」「課」「室」を含む → 役職に追加
+    if (!assigned && !result.title &&
+        /(?:営業|技術|開発|総務|人事|経営|企画|管理|購買|物流|品質|研究|広報|法務|財務|情報)(?:部|課|室|係|本部|グループ|チーム)/.test(l)) {
+      if (!EXCLUDE.title(l)) {
+        result.title = l; used.add(i); assigned = true;
+      }
+    }
+
+    // http/www を含む → other（URLとして保持）
+    if (!assigned && /https?:\/\/|www\./i.test(l)) {
+      result.other.push(l); used.add(i); assigned = true;
+    }
+
+    if (!assigned) fallbackLines.push(l);
   }
 
-  // 重複除去
-  ['email','phone','address','other'].forEach(k => { result[k] = [...new Set(result[k])]; });
+  // ────────────────────────────────────────────────
+  // PASS 4 — 残り → other（ノイズ除去後）
+  // ────────────────────────────────────────────────
+  for (const l of fallbackLines) {
+    // ノイズ行の除外
+    if (l.length > 80) continue;                     // 長すぎる
+    if (/^[・•◆◇■□▶▷]+$/.test(l)) continue;       // 記号のみ
+    if (/^[\d\s\-\.]{1,3}$/.test(l)) continue;       // 1〜3文字の数字（ページ番号等）
+    if (/^(?:E[-\s]?mail|Mail|ホームページ|HP|URL|Website|Web)\s*[:/：]?\s*$/i.test(l)) continue; // ラベルのみ行
+    result.other.push(l);
+  }
+
+  // ── 後処理：重複除去 + 電話番号フォーマット統一 ──
+  ['email','phone','address','other'].forEach(k => {
+    result[k] = [...new Set(result[k])];
+  });
+
+  // 電話番号：正規化して重複排除（ハイフン有無の揺れを吸収）
+  result.phone = deduplicatePhones(result.phone);
+
   return result;
+}
+
+// 電話番号の重複除去（ハイフン除去後に比較）
+function deduplicatePhones(phones) {
+  const seen = new Set();
+  return phones.filter(p => {
+    const key = p.replace(/[\s\-]/g, '');
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
+  });
 }
 
 function reclassify() {
