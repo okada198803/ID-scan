@@ -818,81 +818,264 @@ function cleanText(raw) {
 // ══════════════════════════════════════════════════
 
 /*
-  各フィールドの判定基準（事前学習ルール）
-  ─────────────────────────────────────────
-  email    : @を含み、ドメイン(.jp/.com/.net等)が続く
-  phone    : 日本の電話番号パターン（0X-XXXX-XXXX形式）
-  address  : 〒郵便番号 / 都道府県 / 市区町村 / 番地 / ビル等
-  company  : 株式会社/有限会社/合同会社 / Inc./Ltd. / Holdings等
-  title    : 役職キーワード（部長/課長/CEO/Director等）
-  name     : 漢字2〜5文字 または 英字Firstname Lastname
-  other    : 上記いずれにも一致しない行
+  ══════════════════════════════════════════════════════════════
+  分類ルール定義（強化版）
+  ──────────────────────────────────────────────────────────────
+  email   : @＋有効ドメイン
+  phone   : TEL:/電話: 接頭辞・(市外局番) 形式・標準番号パターン
+  address : 〒/都道府県/市区町村/番地/ビル
+  company : 法人格キーワード（和英）/ 行頭強調パターン
+  title   : 100種以上の役職キーワード（防衛・安全保障含む）
+  name    : 日本語名・英語名（大文字小文字混在対応）
+  ══════════════════════════════════════════════════════════════
 */
 
+// ── 電話番号正規化ヘルパー ─────────────────────────────────
+// (03)1234-5678 / (090)1234-5678 / TEL: 03-1234-5678 などに対応
+function normalizePhoneLine(raw) {
+  // TEL:/FAX:/電話:/直通: などの接頭辞を除去
+  let s = raw.replace(/^[\s　]*(?:TEL|FAX|Tel|Fax|電話|直通|携帯|Mobile|HP|代表|内線)\s*[:/：／]?\s*/i, '');
+  // 全角数字・括弧を半角に
+  s = s.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  s = s.replace(/[（]/g, '(').replace(/[）]/g, ')');
+  // (03)1234-5678 → 03-1234-5678
+  s = s.replace(/\((\d{2,5})\)\s*/g, '$1-');
+  // 余分なスペース除去
+  s = s.replace(/(\d)\s+(\d)/g, '$1$2');
+  return s.trim();
+}
+
+// ── 英語人名正規化ヘルパー ─────────────────────────────────
+// 大文字化パターンを正規化してマッチ精度を上げる
+// JOHN SMITH / john smith / John Smith / JOHN smith → 全て同一判定
+function toNameCase(s) {
+  return s.toLowerCase().replace(/(^\w|\s\w)/g, c => c.toUpperCase());
+}
+function looksLikeEnglishName(l) {
+  const s = l.trim();
+  // 長さ制限：3〜40文字
+  if (s.length < 3 || s.length > 40) return false;
+  // 数字・記号を含む行は除外
+  if (/\d|[@#%&*<>\/\\]/.test(s)) return false;
+
+  // 1. 先頭大文字 Firstname Lastname（標準形）
+  if (/^[A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+$/.test(s)) return true;
+
+  // 2. 全大文字 FIRSTNAME LASTNAME
+  if (/^[A-Z]{2,}(?:\s+[A-Z]\.?)?\s+[A-Z]{2,}$/.test(s)) return true;
+
+  // 3. 全小文字 firstname lastname（OCR誤認識対策）
+  if (/^[a-z]{2,}\s+[a-z]{2,}$/.test(s)) return true;
+
+  // 4. 大文字姓・先頭大文字名：SMITH John / Smith JOHN
+  if (/^[A-Z]{2,}\s+[A-Z][a-z]+$/.test(s) || /^[A-Z][a-z]+\s+[A-Z]{2,}$/.test(s)) return true;
+
+  // 5. ミドルネーム付き：John M. Smith / JOHN M SMITH
+  if (/^[A-Za-z]{2,}\s+[A-Z]\.?\s+[A-Za-z]{2,}$/.test(s)) return true;
+
+  // 6. ハイフン姓：Mary-Jane Watson
+  if (/^[A-Z][a-z]+(?:-[A-Z][a-z]+)?\s+[A-Z][a-z]+$/.test(s)) return true;
+
+  return false;
+}
+
 const RULES = {
+  // ── メールアドレス ──────────────────────────────────────
   email: {
-    // @があり有効なドメインを持つ
     strong: l => /[\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,}/i.test(l),
-    weak:   l => l.includes('@') && l.length < 60,
+    weak:   l => l.includes('@') && l.length < 80,
     extract: l => {
       const m = l.match(/[\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,}/gi);
       return m ? m : [l];
     }
   },
+
+  // ── 電話番号（強化版） ──────────────────────────────────
   phone: {
-    // 固定電話・携帯・フリーダイヤル・国際プレフィックス
-    strong: l => /(?:\+81[-\s]?|0)(?:\d{1,4}[-\s]?\d{1,4}[-\s]?\d{3,4}|[789]0[-\s]?\d{4}[-\s]?\d{4}|120[-\s]?\d{3}[-\s]?\d{3})/.test(l.replace(/[（）()]/g,'')),
-    weak:   l => /\d{2,4}[-\s]\d{2,4}[-\s]\d{3,4}/.test(l),
+    strong: l => {
+      // 接頭辞パターン：TEL: / 電話: / 直通: など
+      if (/(?:TEL|FAX|Tel|Fax|電話|直通|携帯|Mobile)\s*[:/：／]?\s*[\d(（]/i.test(l)) return true;
+      const n = normalizePhoneLine(l);
+      // 標準電話番号パターン（固定・携帯・フリーダイヤル・国際）
+      return /(?:\+81[-\s]?)?(?:0\d{1,4}-\d{1,4}-\d{3,4}|0[789]0-\d{4}-\d{4}|0120-\d{3}-\d{3}|0800-\d{3}-\d{4})/.test(n);
+    },
+    weak: l => {
+      const n = normalizePhoneLine(l);
+      // （市外局番）形式、またはハイフン区切り数字列
+      return /\(\d{2,5}\)\s*\d{3,4}-\d{3,4}/.test(l) ||
+             /\d{2,4}[-\s]\d{2,4}[-\s]\d{3,4}/.test(n);
+    },
     extract: l => {
-      const m = l.replace(/[（）()]/g,'').match(/(?:\+81[-\s]?)?0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{3,4}/g);
-      return m ? m.map(p => p.replace(/\s/g,'')) : [l];
+      const n = normalizePhoneLine(l);
+      // 複数番号の抽出（TEL/FAX が同一行に並ぶ場合も考慮）
+      const m = n.match(/(?:\+81[-\s]?)?0[\d\s-]{8,13}/g);
+      if (m) return m.map(p => p.replace(/\s/g, '').replace(/-+$/, ''));
+      // (市外局番)形式
+      const m2 = l.match(/\(?\d{2,5}\)?[-\s]?\d{3,4}[-\s]?\d{3,4}/g);
+      return m2 ? m2 : [n || l];
     }
   },
+
+  // ── 住所 ─────────────────────────────────────────────────
   address: {
-    // 郵便番号 / 都道府県 / 丁目・番地・号室 / ビル・棟
     strong: l =>
       /〒?\d{3}[-ー]\d{4}/.test(l) ||
       /[東西南北]?[都道府県]|北海道/.test(l) ||
-      /[市区町村]\d|丁目|番地|番[\s　]?号|号室|ビル|タワー|棟|階/.test(l),
-    weak:   l => /[市区町村]/.test(l) && l.length > 5,
+      /[市区町村]\d|丁目|番地|番[\s　]?号|号室|ビル|タワー|棟|[0-9０-９]+階/.test(l),
+    weak: l => /[市区町村]/.test(l) && l.length > 5,
     extract: l => [l.trim()]
   },
+
+  // ── 会社名（強化版） ────────────────────────────────────
   company: {
-    // 法人格 / 英語法人表記 / HD・グループ
-    strong: l =>
-      /株式会社|有限会社|合同会社|合資会社|一般社団法人|公益社団法人|一般財団法人|公益財団法人|医療法人|学校法人|社会福祉法人|NPO法人|協同組合/.test(l) ||
-      /\b(?:Inc\.|Corp\.|Ltd\.|L\.L\.C\.|LLC|GmbH|S\.A\.|Co\.,?\s*Ltd\.?)\b/i.test(l) ||
-      (/(?:グループ|ホールディングス|Holdings|Group)$/.test(l) && l.length < 50),
-    weak: l => /会社|Corporation|Enterprise/.test(l) && l.length < 50,
+    strong: l => {
+      // 和文法人格
+      if (/株式会社|有限会社|合同会社|合資会社|合名会社/.test(l)) return true;
+      if (/一般社団法人|公益社団法人|一般財団法人|公益財団法人/.test(l)) return true;
+      if (/医療法人|学校法人|社会福祉法人|宗教法人|特定非営利活動法人|NPO法人|特殊法人|独立行政法人/.test(l)) return true;
+      if (/協同組合|農業協同組合|漁業協同組合|信用金庫|信用組合|労働金庫/.test(l)) return true;
+      // 英文法人格
+      if (/\b(?:Inc\.|Incorporated|Corp\.|Corporation|Ltd\.|Limited|L\.L\.C\.|LLC|GmbH|S\.A\.|P\.L\.C\.|PLC|Co\.,?\s*Ltd\.?|K\.K\.)\b/i.test(l)) return true;
+      // グループ・HD
+      if (/(?:グループ|ホールディングス|Holdings|Group|Partners|Ventures|Solutions|Systems|Technologies|Industries)\s*$/.test(l) && l.length < 60) return true;
+      // 省庁・官公庁・自衛隊・防衛関連
+      if (/防衛省|防衛庁|自衛隊|陸上自衛隊|海上自衛隊|航空自衛隊|統合幕僚|海上保安庁|警察庁|公安調査庁|内閣情報調査室|外務省|経済産業省|国土交通省|総務省/.test(l)) return true;
+      if (/Agency|Ministry|Department|Bureau|Command|Force|Corps|Division(?!\s*長)/.test(l) && l.length < 60) return true;
+      return false;
+    },
+    weak: l =>
+      /会社|商会|商事|工業|工機|電機|電気|通信|建設|建機|重工|重機|興業|物産|産業|テクノ|システム|サービス|コンサル/.test(l) && l.length < 60 ||
+      /Corporation|Enterprise|International|Global|National|Institute|Foundation|Association|Organization/.test(l) && l.length < 80,
     extract: l => [l.trim()]
   },
+
+  // ── 役職（100種以上・防衛安全保障含む） ────────────────
   title: {
-    // 役職・肩書きキーワード
     strong: l => {
       const kw = [
-        '代表取締役','取締役','代表社員','業務執行','監査役','会長','社長','副社長','専務','常務',
-        '部長','副部長','課長','係長','主任','チーフ','リーダー','マネージャー','ディレクター',
-        '担当','顧問','相談役','参与','執行役員','フェロー','エバンジェリスト',
-        'CEO','CTO','COO','CFO','CMO','CIO','CSO','CPO','CDO','CBO',
-        'Director','Manager','President','Vice President','VP','Senior Manager',
-        'Lead','Head','Principal','Staff','Specialist','Consultant','Advisor',
-        'Engineer','Designer','Developer','Architect','Analyst','Strategist',
-        'Producer','Coordinator','Officer','Associate','Executive','Fellow'
+        // ── 経営層 ─────────────────────────────────────────
+        '代表取締役','取締役','代表社員','業務執行社員','監査役','会計監査人',
+        '会長','副会長','社長','副社長','頭取','理事長','学長','総長','院長','所長',
+        '専務取締役','常務取締役','専務','常務',
+        '執行役員','上席執行役員','特命執行役員',
+        '顧問','相談役','参与','フェロー','名誉会長','名誉顧問',
+        // ── 管理職・ライン ─────────────────────────────────
+        '本部長','副本部長','局長','副局長','部長','副部長','課長','副課長',
+        '係長','班長','グループ長','チームリーダー','室長','センター長','支店長',
+        '営業部長','技術部長','開発部長','製造部長','総務部長','人事部長',
+        '経営企画部長','情報システム部長','法務部長','広報部長','財務部長',
+        '購買部長','物流部長','品質管理部長','研究開発部長',
+        // ── スタッフ・担当 ─────────────────────────────────
+        '主任','主査','主幹','参事','参事官','調査役','副調査役',
+        '担当部長','担当課長','担当主任',
+        '営業担当','技術担当','企画担当','管理担当',
+        // ── 専門職 ─────────────────────────────────────────
+        '弁護士','公認会計士','税理士','社会保険労務士','中小企業診断士',
+        '技術士','建築士','司法書士','行政書士','弁理士','不動産鑑定士',
+        '医師','歯科医師','薬剤師','看護師','保健師','助産師',
+        '教授','准教授','助教','講師','研究員','主任研究員','上席研究員',
+        // ── 営業・販売 ─────────────────────────────────────
+        '営業部','営業課','営業所長','支社長','支所長','出張所長',
+        '販売部','販売課','営業マネージャー','セールスマネージャー',
+        'アカウントマネージャー','アカウントエグゼクティブ',
+        // ── IT・技術 ───────────────────────────────────────
+        'システムエンジニア','ネットワークエンジニア','セキュリティエンジニア',
+        'ソフトウェアエンジニア','クラウドエンジニア','インフラエンジニア',
+        'プログラマー','アーキテクト','テクニカルリード','テックリード',
+        'プロジェクトマネージャー','プロダクトマネージャー','スクラムマスター',
+        'データサイエンティスト','データアナリスト','AIエンジニア','MLエンジニア',
+        'UXデザイナー','UIデザイナー','Webデザイナー','グラフィックデザイナー',
+        // ── 防衛・安全保障・公安 ──────────────────────────
+        '将官','将補','佐官','一佐','二佐','三佐','尉官','一尉','二尉','三尉',
+        '准尉','曹長','一曹','二曹','三曹','士長','一士','二士','自衛官候補生',
+        '統合幕僚長','陸上幕僚長','海上幕僚長','航空幕僚長',
+        '方面総監','師団長','旅団長','連隊長','大隊長','中隊長','小隊長',
+        '防衛官','防衛省職員','防衛審議官','防衛参事官','整備士官',
+        '警視総監','警視監','警視長','警視正','警視','警部','警部補','巡査部長',
+        '海上保安監','海上保安官','保安官',
+        '外交官','大使','公使','参事官','書記官','領事',
+        'インテリジェンスオフィサー','セキュリティアナリスト','サイバーアナリスト',
+        '情報分析官','脅威インテリジェンス','セキュリティコンサルタント',
+        // ── C-Suite・英語役職 ─────────────────────────────
+        'CEO','CTO','COO','CFO','CMO','CIO','CISO','CSO','CPO','CDO','CBO','CRO','CCO','CLO',
+        'President','Vice President','EVP','SVP','AVP',
+        'Director','Senior Director','Executive Director','Managing Director',
+        'General Manager','Senior Manager','Deputy Manager',
+        'Manager','Team Manager','Account Manager','Product Manager','Project Manager',
+        'Lead','Tech Lead','Team Lead','Engineering Lead',
+        'Head','Head of Engineering','Head of Sales','Head of Product',
+        'Principal','Staff Engineer','Distinguished Engineer',
+        'Senior Engineer','Engineer','Junior Engineer',
+        'Architect','Solution Architect','Enterprise Architect',
+        'Analyst','Senior Analyst','Business Analyst','Security Analyst',
+        'Consultant','Senior Consultant','Managing Consultant','Principal Consultant',
+        'Advisor','Senior Advisor','Strategic Advisor',
+        'Specialist','Senior Specialist',
+        'Coordinator','Program Coordinator','Operations Coordinator',
+        'Officer','Chief Officer','Compliance Officer','Security Officer',
+        'Associate','Senior Associate',
+        'Executive','Senior Executive',
+        'Fellow','Distinguished Fellow','Research Fellow',
+        'Researcher','Senior Researcher','Principal Researcher',
+        'Designer','Senior Designer','UX Designer','Product Designer',
+        'Developer','Senior Developer','Full Stack Developer',
+        'Producer','Senior Producer','Executive Producer',
+        'Strategist','Brand Strategist','Content Strategist',
+        'Representative','Sales Representative',
+        'Administrator','System Administrator','Network Administrator',
+        'Supervisor','Operations Supervisor',
+        'Inspector','Security Inspector',
+        'Attaché','Defense Attaché','Military Attaché',
+        'Colonel','Lieutenant Colonel','Major','Captain','Lieutenant',
+        'Admiral','General','Brigadier','Commodore',
       ];
-      return kw.some(k => l.includes(k)) && !l.includes('@') && l.length < 60;
+      return kw.some(k => l.includes(k)) && !l.includes('@') && l.length < 80;
     },
-    weak: l => /役|長$|員$|士$|師$|官$/.test(l) && l.length < 30 && !l.includes('@'),
+    // 弱ルール：語尾・語中パターン
+    weak: l => {
+      if (l.includes('@') || l.length > 40) return false;
+      // 日本語の役職語尾
+      if (/(?:部|課|係|班|室|局|本部|センター|グループ|チーム)(?:長|員|担当)$/.test(l)) return true;
+      if (/役$|長$|員$|士$|師$|官$|佐$|尉$|曹$/.test(l)) return true;
+      // 英語の役職的な単語（単独行）
+      if (/^(?:Sr\.|Jr\.|Senior|Junior|Chief|Deputy|Assistant|Associate)\s+[A-Z]/.test(l)) return true;
+      return false;
+    },
     extract: l => [l.trim()]
   },
+
+  // ── 氏名（大文字小文字混在対応強化版） ─────────────────
   name: {
-    // 日本人名（漢字2〜5文字 or 姓名スペース区切り） / 英語名
-    strong: l =>
-      /^[\u4E00-\u9FFF\u3040-\u30FF]{1,5}[\s　]+[\u4E00-\u9FFF\u3040-\u30FF]{1,5}$/.test(l) ||
-      /^[\u4E00-\u9FFF]{2,4}$/.test(l) ||
-      /^[A-Z][a-z]+(?:\s[A-Z]\.?)?\s[A-Z][a-z]+$/.test(l),
-    weak: l =>
-      /^[\u4E00-\u9FFF\u3040-\u30FF]{2,6}$/.test(l) && l.length <= 6,
-    extract: l => [l.trim()]
+    strong: l => {
+      const s = l.trim();
+      // 日本語名：漢字姓名（スペース区切り）
+      if (/^[\u4E00-\u9FFF\u3040-\u30FF]{1,5}[\s　]+[\u4E00-\u9FFF\u3040-\u30FF]{1,5}$/.test(s)) return true;
+      // 日本語名：漢字2〜4文字（単語）
+      if (/^[\u4E00-\u9FFF]{2,4}$/.test(s)) return true;
+      // 日本語名：読み仮名（ひらがな・カタカナ）
+      if (/^[\u3040-\u30FF]{2,6}[\s　]+[\u3040-\u30FF]{2,6}$/.test(s)) return true;
+      // 英語名（各種大文字パターン）
+      if (looksLikeEnglishName(s)) return true;
+      return false;
+    },
+    weak: l => {
+      const s = l.trim();
+      if (s.length > 20 || s.includes('@')) return false;
+      // 日本語名：漢字・かな2〜8文字
+      if (/^[\u4E00-\u9FFF\u3040-\u30FF]{2,8}$/.test(s)) return true;
+      // 英語名的な2単語（大文字小文字問わず）
+      if (/^[a-zA-Z]{2,}[\s]+[a-zA-Z]{2,}$/.test(s) && s.split(/\s+/).length === 2) return true;
+      return false;
+    },
+    // 抽出時に英語名を正規化（ToNameCase で統一表記）
+    extract: l => {
+      const s = l.trim();
+      // 全大文字 or 全小文字の英語名は先頭大文字に正規化
+      if (/^[A-Z\s.]{4,}$/.test(s) || /^[a-z\s.]{4,}$/.test(s)) {
+        return [toNameCase(s)];
+      }
+      return [s];
+    }
   }
 };
 
