@@ -627,18 +627,65 @@ async function preprocessImage(dataUrl, isPortrait) {
         gray[i] = Math.min(255, Math.max(0, Math.round((gray[i] - lo) / range * 255)));
       }
 
-      // Step 4: アンシャープマスク（ガウスぼかし差分でエッジ強調）
-      const blurred = gaussianBlur(gray, w, h, 1.2);
-      const strength = 1.4; // 強調係数
+      // ─────────────────────────────────────────────────────────
+      // Step 3.5: 背景の複雑さ検出（イラスト・カラー背景対応）
+      // ─────────────────────────────────────────────────────────
+      // 局所的な輝度分散を計算して背景の複雑さを推定する。
+      // 分散が高い = イラストや模様が入った背景 → Sauvolaウィンドウを拡大して
+      // 局所閾値の計算範囲を広げ、背景模様に惑わされにくくする。
+      // ─────────────────────────────────────────────────────────
+      let backgroundVariance = 0;
+      {
+        const sampleStep = Math.max(1, Math.floor(Math.min(w, h) / 40));
+        let sumSq = 0, sumV = 0, cnt = 0;
+        for (let y = 0; y < h; y += sampleStep) {
+          for (let x = 0; x < w; x += sampleStep) {
+            const v = gray[y * w + x];
+            sumV += v; sumSq += v * v; cnt++;
+          }
+        }
+        const mean = sumV / cnt;
+        backgroundVariance = sumSq / cnt - mean * mean;
+      }
+      // 分散が大きい（模様・イラスト多）ほどウィンドウを大きくする
+      const isComplexBg = backgroundVariance > 1800;
+
+      // Step 4: メディアンフィルター（イラスト背景のノイズ除去）
+      // 複雑背景の場合のみ適用。3×3メディアンでランダムノイズを除去し
+      // アンシャープマスクの誤強調を防ぐ。
+      if (isComplexBg) {
+        const med = new Uint8Array(w * h);
+        const buf = new Array(9).fill(0); // fill で undefined を防ぐ
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            let k = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                const yy = clamp(y + dy, 0, h - 1);
+                const xx = clamp(x + dx, 0, w - 1);
+                buf[k++] = gray[yy * w + xx];
+              }
+            }
+            buf.sort((a, b) => a - b);
+            med[y * w + x] = buf[4]; // 中央値
+          }
+        }
+        gray.set(med);
+      }
+
+      // Step 4: アンシャープマスク（エッジ強調）
+      // 複雑背景では強度を抑えて誤強調を防ぐ
+      const blurred = gaussianBlur(gray, w, h, isComplexBg ? 1.5 : 1.2);
+      const strength = isComplexBg ? 1.1 : 1.4;
       for (let i = 0; i < gray.length; i++) {
         gray[i] = clamp(Math.round(gray[i] + strength * (gray[i] - blurred[i])));
       }
 
-      // Step 5: Sauvola 近似による適応的二値化
-      //   各ピクセルを周辺ウィンドウ（radius=16px）の統計で閾値化
-      //   → 照明ムラ・グラデーション背景名刺に強い
-      const R = 16;      // ウィンドウ半径
-      const k = 0.18;    // Sauvola パラメータ
+      // Step 5: Sauvola 適応的二値化
+      // 複雑背景はウィンドウを拡大（R=32）して背景模様を無視しやすくする
+      // 通常背景はR=16で高精度な局所閾値処理
+      const R = isComplexBg ? 32 : 16;
+      const k = isComplexBg ? 0.22 : 0.18;
       const binarized = sauvolaBinarize(gray, w, h, R, k);
 
       // 結果をRGBAに書き戻す
@@ -757,25 +804,21 @@ async function startOCR() {
     const isPortrait = cardOrientation === 'portrait';
 
     // ─── Step A: 前処理 ───────────────────────────
-    setProgress(5, '画像を前処理中（白抜き文字検出含む）...');
+    setProgress(5, '画像を前処理中...');
     const processedData = await preprocessImage(currentImageData, isPortrait);
 
     // ─── Step B: OCRモデル選択 ────────────────────
-    // 縦書き：jpn_vert + jpn（ただし前処理で横回転済みなので jpn も有効）
-    // 横書き：jpn + eng
-    const langs = isPortrait
-      ? ['jpn_vert', 'jpn', 'eng']   // ② jpn_vert を追加
-      : ['jpn', 'eng'];
+    // jpn_vert はCDN環境で読み込みに失敗するケースがあるため
+    // 縦書き前処理（90°回転）済み画像に jpn + eng で対応する
+    const langs = ['jpn', 'eng'];
 
-    // 縦書き前処理で横回転済みなので PSM は両方 3（全自動）で良い
-    // ただし jpn_vert モデル使用時は PSM 5 の方が語順認識が正確
-    const psm = isPortrait ? '5' : '3';
+    // PSM: 整数で指定（v5ではPSM.AUTO=3が安定）
+    const psm = 3; // PSM.AUTO - レイアウト自動検出
 
     setProgress(10, '言語モデルを読み込み中...');
     const worker = await Tesseract.createWorker(langs, 1, {
       logger: m => {
         if (m.status === 'recognizing text') {
-          // 前処理10% + OCR90% の合算進捗
           const ocrPct = Math.round(m.progress * 85);
           setProgress(10 + ocrPct, 'テキスト認識中...');
         } else if (m.status === 'loading language traineddata') {
@@ -786,9 +829,9 @@ async function startOCR() {
       }
     });
 
+    // PSMを整数で設定（v5互換）
     await worker.setParameters({
-      tessedit_pageseg_mode:      psm,
-      preserve_interword_spaces:  '1',  // 単語間スペース保持（後で除去）
+      tessedit_pageseg_mode: psm,
     });
 
     const { data: { text } } = await worker.recognize(processedData);
@@ -804,7 +847,7 @@ async function startOCR() {
     show('step-classify');
   } catch(err) {
     hide('step-progress');
-    showError('OCR処理中にエラーが発生しました。もう一度お試しください。<br><small>' + err.message + '</small>');
+    showError('OCR処理中にエラーが発生しました。<br><small>' + (err.message || String(err)) + '</small>');
     show('step-input');
   }
 }
@@ -1138,10 +1181,22 @@ const RULES = {
 
   // ── 住所 ─────────────────────────────────────────────────
   address: {
-    strong: l =>
-      /〒?\d{3}[-ー]\d{4}/.test(l) ||
-      /[東西南北]?[都道府県]|北海道/.test(l) ||
-      /[市区町村]\d|丁目|番地|番[\s　]?号|号室|ビル|タワー|棟|[0-9０-９]+階/.test(l),
+    strong: l => {
+      if (/〒?\d{3}[-ー]\d{4}/.test(l)) return true;
+      // 都道府県（全47都道府県の略称・誤認識バリアント含む）
+      if (/[東西南北]?[都道府県]|北海道/.test(l)) return true;
+      // 市区町村＋番地・号
+      if (/[市区町村]\d|丁目|番地|番[\s　]?号|号室/.test(l)) return true;
+      // ビル・建物名（拡充）
+      if (/ビル|タワー|棟|階|号室|マンション|ハイツ|コート|プラザ|センター|ガーデン|スクエア|パーク|フロント|ゲートウェイ|テラス|アネックス|ウイング|イースト|ウエスト|ノース|サウス/.test(l)) return true;
+      // 英字住所（海外企業名刺）
+      if (/\b(?:Street|St\.|Avenue|Ave\.|Boulevard|Blvd\.|Road|Rd\.|Lane|Ln\.|Drive|Dr\.|Court|Ct\.|Plaza|Square|Building|Bldg\.|Floor|Suite|Room)\b/i.test(l)) return true;
+      // 国名・州名（英語名刺）
+      if (/\b(?:Japan|USA|UK|Germany|France|Italy|Israel|Sweden|Norway|Australia|Korea|China|Singapore|JAPAN)\b/.test(l)) return true;
+      // 郵便番号（英米形式）
+      if (/\b\d{5}(?:-\d{4})?\b|\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b/.test(l)) return true;
+      return false;
+    },
     weak: l => /[市区町村]/.test(l) && l.length > 5,
     extract: l => [l.trim()]
   },
@@ -1353,11 +1408,11 @@ const DEFENSE_COMPANIES = [
   '富士重工業','SUBARU','スバル',
   'IHI','石川島播磨重工業',
   '日本電気','NEC',
-  '東芝','東芝インフラシステムズ',
-  '富士通','富士通システムズ',
-  '日立製作所','日立','日立システムズ',
-  '小松製作所','コマツ',
-  '日産自動車','トヨタ自動車',
+  '東芝','東芝インフラシステムズ','東芝デジタルソリューションズ',
+  '富士通','富士通システムズ','富士通Japan',
+  '日立製作所','日立','日立システムズ','日立ソリューションズ',
+  '小松製作所','コマツ','小松',
+  '日産自動車','トヨタ自動車','ホンダ','本田技研工業',
   '豊和工業',
   'ダイキン工業',
   '住友重機械工業','住友重機械',
@@ -1366,56 +1421,45 @@ const DEFENSE_COMPANIES = [
   'ヤマハ発動機',
   '矢崎総業',
   '沖電気工業','OKI',
-  'セイコーエプソン',
+  'セイコーエプソン','エプソン',
   '日本無線','JRC',
-  'パナソニック','パナソニックシステムソリューションズジャパン',
+  'パナソニック','パナソニックシステムソリューションズジャパン','パナソニックホールディングス',
   'ソニー','ソニーグループ',
   '京セラ',
   'ルネサスエレクトロニクス',
-  'キヤノン','キヤノン電子',
+  'キヤノン','キヤノン電子','キヤノンマーケティングジャパン',
   'JAMCO','ジャムコ',
   '日本飛行機','ニホンヒコウキ',
   '昭和飛行機工業',
-  '東レ','帝人','クラレ',
-  '三井化学','住友化学','旭化成',
+  '東レ','帝人','クラレ','東洋紡',
+  '三井化学','住友化学','旭化成','三菱ケミカル',
   '日本特殊陶業',
   '日本精工','NSK',
-  'ジャパンエンジン',
+  'ジャパンエンジン','Japan Engine Corporation',
   '日本航空電子工業','JAE',
   '島津製作所',
   'アマダ',
   '旭精機工業','旭精機',
   '日特エンジニアリング',
-  'ATLA','防衛装備庁',
-  // ── 日本：商社・防衛関連商社 ────────────────────────
-  '三菱商事','三菱商事エアロスペース',
-  '丸紅','丸紅エアロスペース','丸紅情報システムズ',
-  '伊藤忠商事','伊藤忠テクノソリューションズ','伊藤忠アビエーション',
-  '住友商事','住友商事マシネックス',
-  '三井物産','三井物産エアロスペース',
-  '双日','双日エアロスペース',
-  'Toyota Tsusho','豊田通商',
-  '阪和興業',
-  '兼松','兼松エアロスペース',
-  '岩谷産業',
-  '長瀬産業',
-  '萩原電気',
-  'コーンズテクノロジー','コーンズ・テクノロジー','CORNES Technologies',
-  'ソリッドソリューションズ','Solid Solutions',
-  'サイトロンジャパン','サイトロン・ジャパン','Sightron Japan',
-  'FLE','株式会社FLE',
-  '旭光学工業','ペンタックス',
-  'ニコン','ニコンソリューションズ',
-  'ライカカメラジャパン',
-  'ケンコー・トキナー','ケンコートキナー',
-  'ビクセン',
-  '東京光学機械','トプコン',
-  'エスコアータ',
-  'NTTデータ','NTTコミュニケーションズ','NTTドコモ',
-  'KDDI','ソフトバンク',
-  '楽天','楽天グループ','楽天ドローン',
+  'ATLA','防衛装備庁','防衛省技術研究本部',
+  '三菱プレシジョン','三菱スペース・ソフトウエア',
+  '富士電機','富士電機システムズ',
+  '古野電気','フルノ',
+  '日本通信電材',
+  '日本電子','JEOL',
+  '東光高岳',
+  '東海光学','東海光学',
+  '三鷹光器',
+  '日本精機','日本精機宝石工業',
+  '住友精密工業',
+  'ナブテスコ','ナブコ',
+  '神戸製鋼所','神鋼',
+  '日本製鉄','JFE','日本製鋼所','JSW',
+  '三菱マテリアル','住友金属鉱山',
+  '日本軽金属','UACJ',
+  '横河電機','横河メータ＆インスツルメンツ',
+  '能美防災','ホーチキ','ニッタン',
   'セコム','アルソック','ALSOK',
-  '能美防災','ホーチキ',
   'テラドローン','Terra Drone',
   'エアロセンス','Aerosense',
   'スカイドライブ','SkyDrive',
@@ -1426,163 +1470,281 @@ const DEFENSE_COMPANIES = [
   'Liberaware','リベラウェア',
   'Skydio Japan',
   'DJI Japan','DJI',
+  'ハイドロニクス','ヒドロニクス',
+  'ダイモス','スペースワン','インターステラテクノロジズ',
+  'QPS研究所','アクセルスペース',
+  '三菱UFJリサーチ&コンサルティング',
+  '野村総合研究所','NRI',
+  '三菱総合研究所','MRI',
+  '電通国際情報サービス','ISID',
+  'サイバーディフェンス研究所',
+  'ラック','LAC',
+  'NICT','情報通信研究機構',
+  'JAXA','宇宙航空研究開発機構',
+  '防衛研究所','NIDS',
+  '経済産業研究所','RIETI',
+  '海上技術安全研究所','交通安全環境研究所',
+  '電子航法研究所','航空宇宙技術研究所',
+  // ── 日本：商社・防衛関連商社 ────────────────────────
+  '三菱商事','三菱商事エアロスペース','三菱商事テクノス',
+  '丸紅','丸紅エアロスペース','丸紅情報システムズ','丸紅ソリューション',
+  '伊藤忠商事','伊藤忠テクノソリューションズ','伊藤忠アビエーション','伊藤忠エアロスペース',
+  '住友商事','住友商事マシネックス','住友商事エレクトロニクス',
+  '三井物産','三井物産エアロスペース','三井物産セキュアディレクション',
+  '双日','双日エアロスペース','双日テック',
+  'Toyota Tsusho','豊田通商',
+  '阪和興業',
+  '兼松','兼松エアロスペース','兼松サステック',
+  '岩谷産業',
+  '長瀬産業',
+  '萩原電気',
+  '丸文','丸文通商','サンワテクノス',
+  '岡谷エレクトロニクス','立花エレテック','加賀電子',
+  'コーンズテクノロジー','コーンズ・テクノロジー','CORNES Technologies',
+  'ソリッドソリューションズ','Solid Solutions',
+  'サイトロンジャパン','サイトロン・ジャパン','Sightron Japan',
+  'FLE','株式会社FLE',
+  '旭光学工業','ペンタックス',
+  'ニコン','ニコンソリューションズ','ニコンビジョン',
+  'ライカカメラジャパン',
+  'ケンコー・トキナー','ケンコートキナー',
+  'ビクセン',
+  '東京光学機械','トプコン',
+  'エスコアータ',
+  'シュアファイアジャパン','Surefire Japan',
+  'ストライカージャパン',
+  'インサイト・テクノロジー・ジャパン',
+  'ナイトフォースジャパン','Nightforce Japan',
+  'タクティカルショップ・フォース','フォースリー',
+  'ATS日本','ATS Japan',
+  'ダイワ精工',
+  'エイテック','Aitec',
+  '日本エフ・エーシステムズ',
+  '電気興業','電気興業防衛',
+  '三菱電機ビルテクノサービス',
+  '日本アビオニクス',
+  '東洋テクニカ',
   // ── 日本：電子・通信・IT防衛関連 ───────────────────
-  '三菱スペース・ソフトウエア','三菱スペースソフトウエア',
-  '三菱プレシジョン',
-  '富士電機','富士電機システムズ',
-  '古野電気','フルノ',
-  '日本通信電材',
-  'ジャパンシステム',
-  'コンピュータサイエンス研究所',
-  'インテック',
+  'NTTデータ','NTTコミュニケーションズ','NTTドコモ','NTT',
+  'KDDI','ソフトバンク','楽天モバイル',
+  '楽天','楽天グループ','楽天ドローン','楽天シンフォニー',
+  'NEC防衛','NECスペーステクノロジー','NECネッツエスアイ',
+  '富士通ディフェンス&ナショナルセキュリティ',
+  '日立国際電気','日立ハイテク',
+  'オムロン','キーエンス',
+  'サイバーコネクトツー','サイバーセキュリティクラウド',
+  'トレンドマイクロ','カスペルスキー',
+  '日本IBM','日本マイクロソフト','日本オラクル',
+  'アクセンチュア','デロイトトーマツ','PwCコンサルティング',
   'SCSK','住商情報システム',
   '伊藤忠テクノロジーベンチャーズ',
   '三菱UFJインフォメーションテクノロジー',
-  'サイバーディフェンス研究所',
-  'ラック','LAC',
-  'キャディ','CADDi',
-  '三菱総合研究所','MRI',
-  '防衛研究所','国防研究所',
-  'NICT','情報通信研究機構',
-  'JAXA','宇宙航空研究開発機構',
+  'パーソルプロセス＆テクノロジー',
+  'インターネットイニシアティブ','IIJ',
+  'ソフトバンク・テクノロジー',
   // ── 海外：米国 主要防衛メーカー ────────────────────
-  'Lockheed Martin','ロッキード・マーティン',
-  'Boeing','ボーイング',
-  'Raytheon','Raytheon Technologies','RTX',
-  'Northrop Grumman','ノースロップ・グラマン',
-  'General Dynamics','ジェネラル・ダイナミクス',
-  'L3Harris Technologies','L3Harris','Harris Corporation',
-  'BAE Systems','BAEシステムズ',
+  'Lockheed Martin','ロッキード・マーティン','Lockheed',
+  'Boeing','ボーイング','Boeing Defense',
+  'Raytheon','Raytheon Technologies','RTX','Raytheon Missiles & Defense',
+  'Northrop Grumman','ノースロップ・グラマン','Northrop',
+  'General Dynamics','ジェネラル・ダイナミクス','GD',
+  'L3Harris Technologies','L3Harris','Harris Corporation','L3 Technologies',
+  'BAE Systems','BAEシステムズ','BAE',
   'Leidos',
   'SAIC','Science Applications International',
   'Booz Allen Hamilton',
   'DXC Technology',
-  'ManTech International',
-  'CACI International',
+  'ManTech International','ManTech',
+  'CACI International','CACI',
   'Cubic Corporation',
-  'FLIR Systems','Teledyne FLIR',
-  'Textron','Bell Textron','Bell Helicopter',
-  'General Atomics','ジェネラル・アトミクス',
+  'FLIR Systems','Teledyne FLIR','Teledyne',
+  'Textron','Bell Textron','Bell Helicopter','Bell Flight',
+  'General Atomics','ジェネラル・アトミクス','GA',
   'DRS Technologies','Leonardo DRS',
   'Elbit Systems of America',
-  'Oshkosh Defense','オシュコシュ',
+  'Oshkosh Defense','オシュコシュ','Oshkosh',
   'AM General',
   'Force Protection Industries',
-  'Polaris Defense',
-  'Axon Enterprise',
+  'Polaris Defense','Polaris Government & Defense',
+  'Axon Enterprise','Axon',
   'Palantir Technologies','Palantir',
-  'Anduril Industries',
+  'Anduril Industries','Anduril',
   'Shield AI',
   'Joby Aviation',
   'Wisk Aero',
   'Skydio',
-  'AeroVironment','エアロバイロンメント',
-  'Shield AI',
-  'Kratos Defense',
+  'AeroVironment','エアロバイロンメント','AV',
+  'Kratos Defense','Kratos',
   'Moog Inc.','Moog',
   'Curtiss-Wright',
-  'Heico Corporation',
-  'TransDigm Group',
-  'Spirit AeroSystems',
-  'Triumph Group',
-  'Parker Hannifin',
+  'Heico Corporation','Heico',
+  'TransDigm Group','TransDigm',
+  'Spirit AeroSystems','Spirit',
+  'Triumph Group','Triumph',
+  'Parker Hannifin','Parker',
   'Honeywell Aerospace','Honeywell',
-  'Collins Aerospace','コリンズ・エアロスペース',
-  'Pratt & Whitney',
-  'GE Aviation','GE Aerospace',
+  'Collins Aerospace','コリンズ・エアロスペース','Collins',
+  'Pratt & Whitney','P&W',
+  'GE Aviation','GE Aerospace','General Electric',
   'United Launch Alliance','ULA',
   'SpaceX',
   'Rocket Lab',
+  'Sierra Nevada Corporation','SNC',
+  'Dynetics',
+  'FLIR','FLIR Systems',
+  'Vectrus',
+  'KBR',
+  'PAE',
+  'VSE Corporation','VSE',
+  'DLT Solutions',
+  'Engility','SAIC Engility',
+  'Peraton',
+  'Leidos Health',
+  'HII','Huntington Ingalls Industries',
+  'Austal USA','Austal',
+  'Fincantieri Marine Group','Fincantieri',
+  'Vigor Industrial',
+  'Metal Storm',
+  'Ashot Ashkelon',
+  'Mercury Systems','Mercury',
+  'OSI Systems','Rapiscan',
+  'DLR Group',
+  'Intelligent Systems','iSystems',
+  'Applied Signal Technology',
+  'Argon ST',
+  'BAE Systems Inc.',
+  'Battelle Memorial Institute','Battelle',
+  'Draper Laboratory','Draper',
+  'Johns Hopkins APL','Johns Hopkins University Applied Physics Laboratory',
+  'MIT Lincoln Laboratory',
+  'RAND Corporation','RAND',
+  'MITRE Corporation','MITRE',
+  'Institute for Defense Analyses','IDA',
+  'Center for Naval Analyses','CNA',
   // ── 海外：欧州 主要防衛メーカー ────────────────────
-  'Airbus Defence and Space','Airbus','エアバス',
-  'SAAB','サーブ',
-  'Thales','タレス',
-  'Leonardo','レオナルド',
-  'Rheinmetall','ラインメタル',
+  'Airbus Defence and Space','Airbus','エアバス','Airbus Defense',
+  'SAAB','サーブ','Saab AB',
+  'Thales','タレス','Thales Group',
+  'Leonardo','レオナルド','Leonardo S.p.A.',
+  'Rheinmetall','ラインメタル','Rheinmetall AG',
   'MBDA',
-  'Diehl Defence','Diehl',
+  'Diehl Defence','Diehl','Diehl Group',
   'Krauss-Maffei Wegmann','KMW',
   'Nexter Systems','KNDS',
   'RUAG',
-  'Kongsberg Defence','コングスベルグ',
+  'Kongsberg Defence','コングスベルグ','Kongsberg Gruppen',
   'Nammo',
   'Patria',
   'Saab Kockums',
-  'Dassault Aviation','ダッソー・アビアシオン',
+  'Dassault Aviation','ダッソー・アビアシオン','Dassault',
   'Naval Group',
-  'Safran','サフラン',
+  'Safran','サフラン','Safran Group',
   'Eurofighter GmbH',
   'MBDA Deutschland',
-  'Hensoldt',
+  'Hensoldt','HENSOLDT',
   'ESG Elektroniksystem',
-  'Rohde & Schwarz','ローデ・シュワルツ',
-  'Heckler & Koch','HK','H&K',
-  'Walther','ワルサー',
-  'Carl Zeiss','カール・ツァイス','Zeiss',
-  'Leica','ライカ',
-  'Steiner Binoculars','シュタイナー',
-  'Schmidt & Bender','シュミット&ベンダー',
-  'Swarovski Optik','スワロフスキー',
+  'Rohde & Schwarz','ローデ・シュワルツ','R&S',
+  'Heckler & Koch','HK','H&K','HK Defense',
+  'Walther','ワルサー','Carl Walther',
+  'Carl Zeiss','カール・ツァイス','Zeiss','Zeiss Optronics',
+  'Leica','ライカ','Leica Camera',
+  'Steiner Binoculars','シュタイナー','Steiner',
+  'Schmidt & Bender','シュミット&ベンダー','S&B',
+  'Swarovski Optik','スワロフスキー','Swarovski',
   'Hensoldt Optronics',
-  'Sig Sauer','SIG Sauer','SIG','シグ',
-  'Glock','グロック',
-  'Beretta','ベレッタ',
-  'FN Herstal','FN','FNH',
-  'Colt','コルト',
-  'Smith & Wesson','S&W',
-  'Ruger',
+  'Sig Sauer','SIG Sauer','SIG','シグ','SIG Arms',
+  'Glock','グロック','Glock Ges.m.b.H.',
+  'Beretta','ベレッタ','Pietro Beretta','Beretta Holding',
+  'FN Herstal','FN','FNH','Fabrique Nationale',
+  'Colt','コルト','Colt Defense','Colt CZ Group',
+  'Smith & Wesson','S&W','American Outdoor Brands',
+  'Ruger','Sturm Ruger',
   'Magpul Industries','Magpul',
   'Trijicon',
   'Aimpoint','エイムポイント',
   'EOTech',
   'Nightforce Optics','Nightforce',
   'US Optics',
-  'Leupold','リューポルド',
+  'Leupold','リューポルド','Leupold & Stevens',
   'Vortex Optics','Vortex',
   'Primary Arms',
-  'Elbit Systems','エルビット・システムズ',
+  'Elbit Systems','エルビット・システムズ','Elbit',
   'Rafael Advanced Defense Systems','Rafael',
   'Israel Aerospace Industries','IAI','イスラエル航空宇宙産業',
   'Tavor','IWI','Israel Weapon Industries',
+  'Soltam Systems','Soltam',
+  'Elisra','Elisra Group',
+  'Tadiran','Tadiran Systems',
+  'ECI Telecom','ECI',
+  'Orbit International','Orbit',
+  'IMI Systems','IMI','Israeli Military Industries',
+  'Astronics','Astronics Corporation',
+  'Ultra Electronics','Ultra',
+  'Chemring Group','Chemring',
+  'QinetiQ',
+  'Cobham','Cobham Advanced Electronic Systems',
+  'Smiths Detection','Smiths Group',
+  'GKN Aerospace','GKN',
+  'Rolls-Royce Defence','Rolls-Royce',
+  'Martin-Baker',
+  'MBDA UK',
+  'Babcock International','Babcock',
+  'Serco',
+  'Meggitt',
+  'Matra','MBDA Matra',
+  'Dynamit Nobel Defence','Dynamit Nobel',
+  'MBDA Italy',
+  'OTO Melara','Leonardo OTO Melara',
+  'Whitehead Alenia','WASS',
+  'PZL Mielec','Leonardo PZL',
+  'OBRUM','HSW',
+  'PCO','PIT-RADWAR',
+  'WB Group','WZM',
+  'Bumar Łabędy',
+  'MSPO','Polish Defence Holdings',
+  'Patria AMVS',
+  'SAKO','Sako Finland',
+  'Tikka',
+  'Nammo Raufoss',
+  'Kongsberg Protech Systems',
+  'Chemring Sensors','Chemring Detection Systems',
+  'MBDA Norway',
+  'Devtac','Devtac Ronin',
   // ── 海外：小火器・個人装備専門メーカー ──────────────
   'Knights Armament','Knights Armament Company','KAC','ナイツアーマメント',
-  'Daniel Defense',
+  'Daniel Defense','DD',
   'LaRue Tactical',
-  'BCM','Bravo Company Manufacturing',
+  'BCM','Bravo Company Manufacturing','Bravo Company USA',
   'Colt Canada',
   'Lewis Machine & Tool','LMT',
   'LWRC International','LWRC',
   'POF USA','Patriot Ordnance Factory',
-  'Barrett','バレット',
-  'Accuracy International','AI','精密インターナショナル',
-  'Sako','サコ',
-  'Tikka',
-  'Blaser','ブラザー',
-  'Anschutz','アンシュッツ',
-  'Steyr Arms','シュタイアー',
+  'Barrett','バレット','Barrett Firearms',
+  'Accuracy International','AI','精密インターナショナル','AICS',
+  'Steyr Arms','シュタイアー','Steyr Mannlicher',
   'Caracal International',
   'Springfield Armory',
-  'Remington Arms','Remington',
-  'Winchester','ウィンチェスター',
-  'Mossberg',
+  'Remington Arms','Remington','RemArms',
+  'Winchester','ウィンチェスター','Winchester Repeating Arms',
+  'Mossberg','O.F. Mossberg',
   'Benelli',
   'Franchi',
   'Fabarm',
-  'Bushmaster',
-  'DPMS',
+  'Bushmaster','Bushmaster Firearms',
+  'DPMS','DPMS Panther Arms',
   'Stag Arms',
   'Windham Weaponry',
-  'Rock River Arms',
+  'Rock River Arms','RRA',
   'Adams Arms',
   'Diamondback Firearms',
-  'Palmetto State Armory',
-  'Black Rain Ordnance',
-  'Noveske Rifleworks',
+  'Palmetto State Armory','PSA',
+  'Black Rain Ordnance','BRO',
+  'Noveske Rifleworks','Noveske',
   'Geissele Automatics','Geissele',
   'Aero Precision',
   'Ballistic Advantage',
   'Criterion Barrels',
-  'JP Enterprises',
+  'JP Enterprises','JP Rifles',
   'ALG Defense',
   'Triggertech',
   'CMC Triggers',
@@ -1590,85 +1752,98 @@ const DEFENSE_COMPANIES = [
   'Les Baer Custom',
   'Ed Brown Products',
   'Nighthawk Custom',
-  'Kimber','キンバー',
-  'STI International','Staccato',
-  'CZ','CZ-USA','チェコ兵器工廠',
-  'Ceska Zbrojovka',
+  'Kimber','キンバー','Kimber Manufacturing',
+  'STI International','Staccato','Staccato 2011',
+  'CZ','CZ-USA','チェコ兵器工廠','Ceska Zbrojovka',
   'Arsenal','アーセナル',
   'Krebs Custom',
-  'Kalashnikov Concern',
+  'Kalashnikov Concern','Kalashnikov',
   'Molot','モロト',
   'Vepr',
   'Izhmash','イジュマッシュ',
-  'Blue Force Gear',
+  'Blue Force Gear','BFG',
   'Ferro Concepts',
   'First Spear',
   'Spiritus Systems',
-  'Crye Precision','クライ・プリシジョン',
-  'Patagonia Provisions','Patagonia',
-  'Arc\'teryx','アークテリクス',
+  'Crye Precision','クライ・プリシジョン','Crye',
+  'Patagonia','Arc\'teryx','アークテリクス',
   'Eagle Industries',
-  'Blackhawk',
+  'Blackhawk','Blackhawk Products',
   'Safariland',
   'Bianchi',
-  'Uncle Mike\'s',
   'Tactical Tailor',
   'High Speed Gear','HSGI',
   'Esstac',
-  'Haley Strategic','HSP',
-  'Mystery Ranch','ミステリーランチ',
-  'MYSTERY RANCH',
+  'Haley Strategic','HSP','Haley Strategic Partners',
+  'Mystery Ranch','ミステリーランチ','MYSTERY RANCH',
   'Kifaru',
   'Eberlestock',
   'Camelbak','キャメルバック',
-  'Revision Military',
+  'Revision Military','Revision',
   'Wiley X',
-  'Oakley','オークリー',
-  'Gentex Corporation',
+  'Oakley','オークリー','Oakley SI',
+  'Gentex Corporation','Gentex',
   'Ops-Core','OpsCore',
   'Team Wendy',
   'Point Blank Enterprises',
   'Safariland Ballistics',
-  'Ceradyne',
+  'Ceradyne','3M Ceradyne',
   'Protective Products',
+  'Velocity Systems',
+  'Mayflower Research & Consulting','Mayflower RC',
+  'London Bridge Trading','LBT',
+  'Tactical Assault Gear','TAG',
+  'Spec.-Ops. Brand',
+  'Condor Outdoor','Condor',
+  'Vertx',
+  'Propper',
+  'Tru-Spec',
+  '5.11 Tactical','5.11',
+  'Salomon Forces','Salomon',
+  'Lowa','LOWA Boots',
+  'Haix','HAIX Boots',
+  'Bates Footwear','Bates',
+  'Belleville Boots','Belleville',
+  'Garmont','Garmont Tactical',
+  'Surefire','SureFire',
+  'Streamlight',
+  'Cloud Defensive','REIN',
+  'Modlite Systems','Modlite',
+  'Arisaka Defense','Arisaka',
+  'Unity Tactical',
+  'Reptilia Corp','Reptilia',
+  'Geissele Super Precision',
+  'Badger Ordnance','Badger',
+  'American Defense Manufacturing','ADM',
+  'Spuhr',
+  'Kinetic Development Group','KDG',
+  'BCM GUNFIGHTER',
+  'Streamlight Protac',
+  'Peltor','Peltor 3M',
+  'MSA Safety','MSA',
+  'Dräger','Draeger','Drager',
+  'Scott Aviation','Scott Safety',
+  'Avon Protection','Avon',
+  'Mestel Safety',
   // ── 海外：ドローン・無人機専門メーカー ──────────────
   'DJI','大疆創新',
-  'Parrot','パロット',
+  'Parrot','パロット','Parrot SA',
   'Autel Robotics','Autel',
   'Yuneec',
   'Insitu','Boeing Insitu',
   'AeroVironment','AV',
-  'Textron Systems',
+  'Textron Systems','Textron Unmanned Systems',
   'General Atomics Aeronautical','GA-ASI',
   'Northrop Grumman Systems',
   'Shield AI',
   'Joby',
   'Wisk',
-  'Joby Aviation',
-  'Archer Aviation',
+  'Archer Aviation','Archer',
   'Zipline',
   'Wingcopter',
   'Volocopter',
   'Lilium',
   'Bye Aerospace',
-  'Zenith Aerospace',
-  'Sentien Robotics',
-  'Iris Automation','Iris',
-  'Cape',
-  'Percepto',
-  'Dedrone','デドロン',
-  'DroneShield','ドローンシールド',
-  'D-Fend Solutions',
-  'Fortem Technologies',
-  'SRC Inc.',
-  'Liteye Systems',
-  'MyDefence',
-  'Drone Defence',
-  'Sentrycs',
-  'Squarehead Technology',
-  'Robin Radar Systems',
-  'SkySafe',
-  'Drone Volt',
   'Quantum Systems',
   'Wingtra',
   'senseFly',
@@ -1678,10 +1853,8 @@ const DEFENSE_COMPANIES = [
   'Flyability',
   'Freefly Systems',
   'Sony Airpeak',
-  'Kespry',
   'PrecisionHawk',
   'Identified Technologies',
-  'Skydio',
   'Impossible Aerospace',
   'Sabrewing Aircraft',
   'Airobotics','エアロボティクス',
@@ -1697,27 +1870,50 @@ const DEFENSE_COMPANIES = [
   'AirMap',
   'OneSky',
   'Airspace Link',
+  'Percepto',
+  'Drone Volt',
+  'Hoverfly Technologies',
+  'SenseFly','eBee',
+  'WingtraOne',
+  'Delair','Delair-Tech',
+  'Azur Drones',
+  'Quaternium',
+  'Schiebel','S-100 Camcopter',
+  'Skeldar','Skeldar Aviation',
+  'UMS Aerowork',
+  'TEKEVER',
+  'Inpixon',
+  'Draganflyer',
+  'FreeFly Alta',
+  'Freefly Alta X',
+  'ModalAI',
+  'Skydio R1','Skydio 2',
+  'Inspired Flight Technologies','IFT',
+  'Joby S4',
+  'Uber Elevate',
+  'Wisk Cora',
+  'Overair',
   // ── 海外：C-UAS・電子戦・サイバー ───────────────────
   'Leonardo DRS',
-  'SRC Inc.',
+  'SRC Inc.','SRC',
   'Epirus',
   'Hpwave',
   'Xtend','Xtend Robotics',
   'Flex Force Enterprises',
   'Jaycor',
   'Titan Aerospace',
-  'Siklu Communication',
+  'Siklu Communication','Siklu',
   'Eclipse Electronix',
   'BAE Systems Electronic Systems',
   'Raytheon Intelligence & Space',
   'Northrop Grumman Mission Systems',
   'L3Harris ISR',
-  'Sierra Nevada Corporation','SNC',
   'General Atomics Electromagnetic Systems',
   'Battelle Memorial Institute','Battelle',
   'SRC Radar',
   'Citadel Defense',
-  'Dedrone',
+  'Dedrone','デドロン',
+  'DroneShield','ドローンシールド',
   'IXI Electronic Warfare',
   'Elbit Systems EW',
   'Northrop Electronic Systems',
@@ -1726,9 +1922,65 @@ const DEFENSE_COMPANIES = [
   'Rohde & Schwarz EW',
   'Frequentis',
   'Systematic',
+  'D-Fend Solutions',
+  'Fortem Technologies','Fortem',
+  'MyDefence',
+  'Drone Defence',
+  'Sentrycs',
+  'Squarehead Technology',
+  'Robin Radar Systems','Robin Radar',
+  'SkySafe',
+  'Iris Automation','Iris',
+  'Cape',
+  'Dedrone RF100',
+  'CODA Octopus','CODA',
+  'Indra Sistemas','Indra',
+  'SELEX Galileo',
+  'ELT Group',
+  'Elettronica Group','Elettronica',
+  'SY Technology',
+  'Advanced Electronic Systems','AES',
+  'Orbit Communication Systems','Orbit',
+  'Javelin Systems',
+  'Diehl BGT Defence',
+  'TDW Gesellschaft','TDW',
+  'Bayern-Chemie',
+  'MW Technology',
+  'CrowdStrike','クラウドストライク',
+  'Palo Alto Networks','パロアルトネットワークス',
+  'Mandiant','FireEye Mandiant',
+  'Darktrace',
+  'IronNet','IronNet Cybersecurity',
+  'Cylance','BlackBerry Cylance',
+  'Tanium',
+  'Cybereason','サイバーリーズン',
+  'Vectra AI',
+  'Exabeam',
+  'LogRhythm',
+  'Secureworks',
+  'Recorded Future',
+  // ── 韓国・その他アジア ───────────────────────────────
+  'Hanwha Aerospace','Hanwha','ハンファ',
+  'Korea Aerospace Industries','KAI',
+  'LIG Nex1','LIG넥스원',
+  'Samsung Techwin','Samsung Thales',
+  'Hyundai Rotem','ヒュンダイ',
+  'Doosan Infracore',
+  'ST Engineering','Singapore Technologies',
+  'Elbit Systems Asia',
+  'Singapore Technologies Kinetics','STK',
+  'DSTA','Defence Science and Technology Agency',
+  // ── オーストラリア ────────────────────────────────────
+  'Austal',
+  'Thales Australia',
+  'BAE Systems Australia',
+  'Defence Science and Technology Group','DST Group',
+  'CEA Technologies',
+  'EOS Defence Systems','EOS',
+  'Electro Optic Systems',
 ];
 
-// ── ⑤ 姓名辞書（日本語苗字300種・英語姓・欧州姓） ──────────
+// ── ⑤ 姓名辞書（日本語苗字450種・英語姓・欧州姓） ──────────
 const JP_SURNAMES = [
   // 1〜50位
   '佐藤','鈴木','高橋','田中','伊藤','渡辺','山本','中村','小林','加藤',
@@ -1749,23 +2001,41 @@ const JP_SURNAMES = [
   '田口','吉野','樋口','岩田','秋山','北村','神田','北川','白石','大森',
   '松浦','西岡','内山','玉田','石原','大谷','杉本','松下','吉岡','前川',
   // 151〜200位
-  '向井','大島','佐野','川村','福島','若林','天野','小山','山田','河合',
-  '梅田','岸','角田','川田','早川','黒木','宮田','金田','野中','石橋',
-  '伊東','田辺','中田','中村','長谷部','吉武','根本','熊谷','飯島','岡崎',
-  '松岡','三宅','横田','川島','柳','荻原','山中','滝沢','渡邊','今村',
-  '上田','浅野','植田','植木','東野','奥村','小倉','小沢','小田','川北',
+  '向井','大島','佐野','川村','福島','若林','天野','小山','河合','梅田',
+  '岸','角田','川田','早川','黒木','宮田','金田','野中','石橋','伊東',
+  '田辺','中田','長谷部','吉武','根本','熊谷','飯島','岡崎','松岡','三宅',
+  '横田','川島','柳','荻原','山中','滝沢','渡邊','今村','浅野','植田',
+  '植木','東野','奥村','小倉','小沢','小田','川北','亀田','菊池','北島',
   // 201〜250位
-  '亀田','菊池','北島','木下','木村','清野','桑原','小沢','坂田','佐口',
-  '沢田','鹿島','高岡','高尾','高野','高山','田口','田代','田畑','土井',
-  '中岡','中尾','中沢','長島','長野','西川','西沢','西野','西原','服部',
-  '浜崎','浜本','深沢','藤川','藤木','藤本','古田','堀田','本間','松川',
-  '松村','三島','三原','村木','村松','望月','山岡','山岸','山口','山村',
+  '木下','清野','桑原','坂田','沢田','鹿島','高岡','高尾','高野','高山',
+  '田代','田畑','土井','中岡','中尾','中沢','長島','長野','西川','西沢',
+  '西野','西原','服部','浜崎','浜本','深沢','藤川','藤木','藤本','古田',
+  '堀田','本間','松川','松村','三島','三原','村木','村松','山岡','山岸',
+  '山村','吉村','米田','若山','渡邉','和田','青山','赤坂','秋元','浅川',
   // 251〜300位
-  '吉田','吉村','米田','若山','渡邉','和田','青山','赤坂','秋元','浅川',
-  '新田','石本','市原','伊藤','入江','上原','植村','宇田','大久保','大橋',
-  '大平','大堀','岡部','奥山','小澤','加島','片岡','片桐','金井','鎌田',
-  '上村','川合','河口','河内','川崎','川添','川端','川西','菊野','北田',
-  '木田','工藤','国分','倉持','黒岩','小泉','小平','古賀','小池','越田',
+  '新田','石本','市原','入江','上原','植村','宇田','大久保','大平','大堀',
+  '岡部','奥山','小澤','加島','片岡','片桐','金井','鎌田','上村','川合',
+  '河口','河内','川崎','川添','川端','川西','菊野','北田','木田','国分',
+  '倉持','黒岩','小泉','小平','古賀','小池','越田','五十嵐','磯部','梅原',
+  '江口','大沼','岡野','尾上','海老原','柏木','勝田','加納','紙谷','川北',
+  // 301〜350位（追加）
+  '川瀬','川西','神谷','木内','木崎','久我','草野','国沢','栗林','黒川',
+  '黒沢','小出','近藤','坂口','坂井','佐伯','佐久間','沢井','沢口','篠原',
+  '篠田','柴田','島','清野','菅野','杉浦','杉田','鈴江','関口','関根',
+  '瀬川','園田','高梨','高根','多田','谷川','玉川','玉城','千田','寺田',
+  '寺西','土井','徳田','戸田','外山','内藤','中井','中辻','中谷','長澤',
+  // 351〜400位（追加）
+  '長尾','西尾','野崎','野沢','野島','橋爪','畑中','花田','濱田','原口',
+  '原島','東田','平井','平岡','平石','平尾','深田','藤沢','藤島','別府',
+  '星野','本庄','牧野','益田','三木','溝口','宮内','宮川','宮原','宮脇',
+  '武藤','森田','森本','矢口','矢田','矢島','安田','柳田','柳沢','山川',
+  '山城','山科','山瀬','山富','山根','山路','山野','山倉','横井','横尾',
+  // 401〜450位（追加）
+  '横川','横沢','吉井','吉沢','吉澤','吉原','吉本','米澤','鷲田','浅井',
+  '浅田','安西','安部','安倍','阿久津','阿倍','芦田','阿曽','芦川','足立',
+  '麻生','荒木','荒井','有田','有吉','飯塚','池上','池田','石黒','石倉',
+  '泉','井手','稲葉','今野','岩下','岩本','上杉','上川','植木','上野',
+  '牛田','馬場','大賀','大川','大倉','大坂','大高','大原','大村','奥野',
 ];
 
 const EN_SURNAMES = [
@@ -1885,31 +2155,44 @@ const EXCLUDE = {
 // 分類メイン関数（4パス版）
 // ══════════════════════════════════════════════════
 function classify(text) {
-  const rawLines = text.split('\n').map(l => l.trim()).filter(l => l.length >= 1);
-  const result = {
+  // ── 電話番号の同一行分割（TEL/FAX同一行対応） ──────────
+  // 「TEL:03-1234-5678　FAX:03-1234-5679」のような1行を
+  // 複数行に分割してから処理する
+  const splitLines = [];
+  for (const rawLine of text.split('\n')) {
+    const l = rawLine.trim();
+    if (!l) { splitLines.push(l); continue; }
+    // TEL/FAXが同一行に並ぶパターンを分割
+    const telFaxPattern = /(?:TEL|Tel\.?|PHONE)\s*[:/.]?\s*([\d\(\（\-\+\s]{6,}?)(?=\s{2,}|\s+(?:FAX|Fax\.?))/i;
+    const faxPattern    = /(?:FAX|Fax\.?)\s*[:/.]?\s*([\d\(\（\-\+\s]{6,})/i;
+    const tm = l.match(telFaxPattern);
+    const fm = l.match(faxPattern);
+    if (tm && fm) {
+      splitLines.push('TEL:' + tm[1].trim());
+      splitLines.push('FAX:' + fm[1].trim());
+    } else {
+      splitLines.push(l);
+    }
+  }
+
+  const rawLines = splitLines.map(l => l.trim()).filter(l => l.length >= 1);
+  let result = {
     email:[], phone_fixed:[], phone_fax:[], phone_mobile:[],
     address:[], company:'', name:'', title:'', other:[]
   };
   const used = new Set();
   const n    = rawLines.length;
 
-  function posRatio(i) { return n <= 1 ? 0.5 : i / (n - 1); }
-  function posBonus(field, i) {
-    const r = posRatio(i);
-    if (field === 'company')     return r < 0.35 ? 2 : r < 0.6 ? 0 : -1;
-    if (field === 'name')        return r > 0.2 && r < 0.65 ? 2 : 0;
-    if (field === 'title')       return r > 0.25 && r < 0.7 ? 1 : 0;
-    if (/phone/.test(field))     return r > 0.5 ? 1 : 0;
-    if (field === 'email')       return r > 0.5 ? 1 : 0;
-    if (field === 'address')     return r > 0.5 ? 1 : 0;
-    return 0;
-  }
+  // ① posBonus廃止：名刺ごとに配置が異なるため位置スコアは使わない
+  // ② contextBonus のみ継続：前後行の内容による文脈判定は有効
   function contextBonus(field, i) {
     const prev = i > 0   ? rawLines[i-1] : '';
     const next = i < n-1 ? rawLines[i+1] : '';
     if (field === 'name') {
+      // 防衛企業辞書・法人格を含む行の直後は氏名候補スコアアップ
       if (/株式会社|有限会社|合同会社/.test(prev)) return 2;
-      if (RULES.title.strong(next))               return 2;
+      if (DEFENSE_COMPANIES.some(c => prev.includes(c)))  return 2;
+      if (RULES.title.strong(next))                       return 2;
     }
     if (field === 'title') {
       if (RULES.name.strong(prev) || looksLikeEnglishName(prev)) return 2;
@@ -1966,7 +2249,7 @@ function classify(text) {
       if (used.has(i) || !rule.strong(rawLines[i])) continue;
       const l = rawLines[i];
       if (EXCLUDE[fld] && EXCLUDE[fld](l)) continue;
-      const score = 3 + posBonus(fld, i) + contextBonus(fld, i);
+      const score = 3 + contextBonus(fld, i);
       if (score < 2) continue;
 
       if (fld === 'phone') {
@@ -1995,7 +2278,7 @@ function classify(text) {
       if (used.has(i) || !rule.weak(rawLines[i])) continue;
       const l = rawLines[i];
       if (EXCLUDE[fld] && EXCLUDE[fld](l)) continue;
-      const score = 2 + posBonus(fld, i) + contextBonus(fld, i);
+      const score = 2 + contextBonus(fld, i);
       if (score < 2) continue;
 
       if (fld === 'phone') {
@@ -2113,16 +2396,59 @@ function classify(text) {
   }
 
   // ── 後処理：重複除去 ─────────────────────────────
-  // ⑦ メール：小文字化して重複排除
-  result.email = [...new Map(result.email.map(e => [e.toLowerCase(), e])).values()];
-  // ⑦ 電話：ハイフン除去後に比較
+  result.email   = [...new Map(result.email.map(e => [e.toLowerCase(), e])).values()];
   result.phone_fixed  = deduplicatePhones(result.phone_fixed);
   result.phone_fax    = deduplicatePhones(result.phone_fax);
   result.phone_mobile = deduplicatePhones(result.phone_mobile);
-  // ⑦ 住所：全角数字を半角化して比較
   result.address = deduplicateAddresses(result.address);
   result.other   = [...new Set(result.other)];
 
+  // ── 同一市外局番ルール：固定電話とFAXの自動振り分け ──
+  // 「固定電話が複数あり、かつFAXが未検出」の場合:
+  //   → 同一市外局番の2番目以降を FAX として振り替える
+  //   （通常の名刺では固定番号が先、FAXが後に記載される）
+  result = applyAreaCodeFaxRule(result);
+
+  return result;
+}
+
+// 市外局番の抽出（0X〜0XXXX）
+function extractAreaCode(num) {
+  const n = (num || '').replace(/\D/g, '');
+  if (!n.startsWith('0')) return '';
+  // フリーダイヤル・0ABJ番号の市外局番
+  const patterns = [
+    /^(0120|0800|0570|0990)/,           // 特番（4桁）
+    /^(03|06|011|022|052|076|092|045|046|047|048|049|043|042|044)/,  // 大都市（2〜3桁）
+    /^(0\d{1,4})/,                      // その他
+  ];
+  for (const p of patterns) {
+    const m = n.match(p);
+    if (m) return m[1];
+  }
+  return n.slice(0, 4);
+}
+
+function applyAreaCodeFaxRule(result) {
+  // FAXが未検出で固定電話が2本以上ある場合のみ判定
+  if (result.phone_fax.length > 0) return result;
+  if (result.phone_fixed.length < 2) return result;
+
+  const areaCodes = result.phone_fixed.map(extractAreaCode);
+  const firstCode = areaCodes[0];
+
+  // 2番目以降で市外局番が一致するものを FAX 候補とする
+  const newFixed = [result.phone_fixed[0]];
+  const newFax   = [];
+  for (let i = 1; i < result.phone_fixed.length; i++) {
+    if (areaCodes[i] === firstCode && firstCode !== '') {
+      newFax.push(result.phone_fixed[i]);  // 同一局番の2本目以降→FAX
+    } else {
+      newFixed.push(result.phone_fixed[i]); // 別局番はそのまま固定に残す
+    }
+  }
+  result.phone_fixed = newFixed;
+  result.phone_fax   = newFax;
   return result;
 }
 
